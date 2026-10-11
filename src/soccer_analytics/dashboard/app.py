@@ -2455,12 +2455,15 @@ MATCH_SCOPED_STATE = (
     "step3_flash",
 )
 
-st.header("Match archive")
+st.header("Select session")
 match_ids = library.list_ids()
 
+# Two compact choices: which analysis to reopen, and which footage folder this session works on. The videos
+# themselves are chosen in Step 1, right where they are used - picking a video up here and the same video again as
+# a "clip" below was one selection too many. The analysis lives beside the footage either way.
 with st.container(border=True):
-    session_col, footage_col = st.columns([1, 2])
-    with session_col:
+    match_col, folder_col = st.columns([1, 1])
+    with match_col:
         # A match saved in the last run asks to be selected. A widget's state can only be set before that widget
         # exists in the run, and the save button runs after this module has been drawn, so it leaves the id here for
         # the next run to pick up.
@@ -2488,13 +2491,8 @@ with st.container(border=True):
             st.session_state["archive_scope"] = match_id
             for scoped in MATCH_SCOPED_STATE:
                 st.session_state.pop(scoped, None)
-        st.caption(
-            f"Everything for this match is saved with the footage: `{_location_label(library.path(match_id))}`"
-            if match_id
-            else "No analysis selected - pick footage below and start one, and it is saved beside the video."
-        )
 
-    with footage_col:
+    with folder_col:
         video_options = discover_videos()
         if not video_options:
             searched = ", ".join(str(root) for root in video_roots())
@@ -2503,9 +2501,8 @@ with st.container(border=True):
 
         # Selecting an analysis has to bring back the footage it was recorded from, or it cannot be reopened: the
         # picker would stay on whichever video happened to be newest and Step 2 would find no segment belonging to
-        # the match. The widget is keyed per match rather than mutated, so each match remembers its own choice and
-        # a first visit opens on the footage the analysis was made from. The recorded path is resolved against the
-        # analysis directory, so a match folder that has been moved still opens its own video.
+        # the match. The recorded path is resolved against the analysis directory, so a match folder that has been
+        # moved still opens its own video.
         pinned_source: str | None = None
         default_video_folder = "All folders"
         if match_id is not None:
@@ -2517,135 +2514,127 @@ with st.container(border=True):
             elif recorded:
                 st.warning("The footage this match was recorded from is not reachable: " + ", ".join(recorded))
 
-        video_col, probe_col = st.columns([2, 1])
-        with video_col:
-            # Two levels: the recordings live in one folder per match (and matches for several teams sit side by
-            # side), so the picker browses by folder instead of scrolling one flat list from every disk.
-            folders = sorted({str(Path(option).parent) for option in map(str, video_options)})
-            folder_choices = ["All folders", *folders]
-            folder_index = (
-                folder_choices.index(default_video_folder) if default_video_folder in folder_choices else 0
-            )
-            folder = st.selectbox(
-                "Folder",
-                folder_choices,
-                index=folder_index,
-                format_func=lambda entry: entry if entry == "All folders" else _location_label(Path(entry)),
-                key=f"video_folder::{match_id}",
-            )
-            visible = [
-                path
-                for path in video_options
-                if folder == "All folders" or str(Path(path).parent) == folder
-            ]
-            # Whatever folder is shown, the open match's own footage and the last choice must stay selectable -
-            # a selectbox whose value is not among its options breaks on the next run.
-            for keep in (pinned_source, st.session_state.get(f"source_video::{match_id}")):
-                if keep and keep not in {str(path) for path in visible}:
-                    visible.insert(0, Path(keep))
-            option_strings = [str(path) for path in visible]
-            default_index = option_strings.index(pinned_source) if pinned_source in option_strings else 0
-
-            def _open_analysis_beside_video() -> None:
-                """A video that already has an analysis saved beside it opens that analysis automatically.
-
-                Only while no analysis is selected: with one open, changing the video means "analyze this footage
-                under the open match" (a match is usually created on a clip and then analyzed on the combined game),
-                and switching the selection out from under that would fight the user.
-                """
-                if match_id is not None:
-                    return
-                selected_video = st.session_state.get(f"source_video::{match_id}")
-                if not isinstance(selected_video, str):
-                    return
-                found = _analysis_for_video(selected_video)
-                if found:
-                    st.session_state["archive_select_pending"] = found
-
-            chosen = st.selectbox(
-                "Video (newest first)",
-                option_strings,
-                index=default_index, format_func=_video_label,
-                key=f"source_video::{match_id}",
-                on_change=_open_analysis_beside_video,
-                help=(
-                    "Videos found under the footage roots, newest first. One that already has an analysis "
-                    "(marked `- analysis saved`) opens it when picked."
-                ),
-            )
-            manual = st.text_input(
-                "...or paste an absolute path", placeholder="/path/to/match.MP4", key=f"manual_video::{match_id}"
-            )
-            if manual.strip():
-                chosen = manual.strip()
-            if match_id is None:
-                st.caption(
-                    "Starting an analysis saves it with the video: `"
-                    f"{_location_label(analysis_dir_for(chosen))}` - everything later lands in that folder."
-                )
-        with probe_col:
-            if not Path(chosen).exists():
-                st.error("File not found.")
-                st.stop()
-            probe = probe_cached(chosen)
-            st.metric("Resolution", f"{probe.width}x{probe.height}")
-            st.metric("Source FPS", f"{probe.fps:.0f}")
-            st.metric("Duration", f"{probe.duration_s / 60:.1f} min")
-
-# Starting the session: the analysis directory beside the footage, which is what everything below is stored in.
-# It is normally created by pressing "Start a match analysis" - or automatically by the first Run analysis - and it
-# is re-opened by simply picking a video that has one.
-if match_id is None:
-    def _create_match() -> None:
-        """Runs before the next run's body, so this module picks the new analysis up in that same run."""
-        existing = _analysis_for_video(chosen)
-        record = library.create(chosen)
-        st.session_state["archive_select_pending"] = record.match_id
-        st.session_state["session_flash"] = (
-            "success",
-            f"`{record.match_id}` already had an analysis beside the footage - opened it rather than starting "
-            "a second one."
-            if existing
-            else f"`{record.match_id}` started - saved with the footage in "
-            f"`{_location_label(library.path(record.match_id))}`.",
+        # The recordings live in one folder per match (and matches for several teams sit side by side), so the
+        # folder narrows Step 1's video list instead of scrolling one flat list from every disk.
+        folders = sorted({str(Path(option).parent) for option in map(str, video_options)})
+        folder_choices = ["All folders", *folders]
+        folder_index = (
+            folder_choices.index(default_video_folder) if default_video_folder in folder_choices else 0
+        )
+        folder = st.selectbox(
+            "Folder",
+            folder_choices,
+            index=folder_index,
+            format_func=lambda entry: entry if entry == "All folders" else _location_label(Path(entry)),
+            key=f"video_folder::{match_id}",
+            help="Step 1 lists the videos in the chosen folder; the analysis is saved beside them.",
         )
 
-    st.button(
-        "Start a match analysis for this footage",
-        type="primary",
-        on_click=_create_match,
-        help=(
-            "Writes the match record into an `analysis/` folder beside the video. Every later step stores its "
-            "results there too, so copying the match folder carries the whole analysis with it."
-        ),
+        with st.expander("...or open one video by its path"):
+            manual = st.text_input(
+                "Path to the video", placeholder="/path/to/match.MP4", key=f"manual_video::{match_id}"
+            )
+
+    st.caption(
+        f"Everything for this match is saved with the footage: `{_location_label(library.path(match_id))}`"
+        if match_id
+        else "Pick a folder here; its videos are chosen in Step 1 below, and the analysis is saved beside them."
     )
-show_flash("session_flash")
 
 # --------------------------------------------------------------------------------------------------------------
 # Step 1 - the heavy pass
 # --------------------------------------------------------------------------------------------------------------
 st.header("Step 1 - Run the heavy pass")
+show_flash("session_flash")
 show_flash("step1_flash")
 
-# --- one game out of several clips ----------------------------------------------------------------------------
-# The camera writes ~30-minute files, so a game arrives as two or three of them. Combining them (a stream copy, no
-# re-encode) gives one video with one clock, which is what everything downstream needs: one camera-motion chain, one
-# set of player tracks, and one timeline to hang kick-off, half-time and full-time on.
-game_record = game_lib.find_for_video(chosen)
+# --- the session's footage: the video, or the game's clips ----------------------------------------------------
+# One chooser, right where the footage is used. One recording is analyzed as itself; several are one game - the
+# camera names each clip by its start time, so their order is read from the names - and the button below records
+# the manifest that ties them together. Nothing is copied or re-encoded, and no merged video is produced. A game
+# that already exists is recognized from any of its clips, so picking one reopens it.
+visible = [
+    path
+    for path in video_options
+    if folder == "All folders" or str(Path(path).parent) == folder
+]
+# Whatever folder is shown, the open match's own footage and the last choice must stay selectable - a multiselect
+# whose stored value is not among its options would not come back.
+for keep in [pinned_source, *(st.session_state.get(f"game_clips::{match_id}") or [])]:
+    if keep and keep not in {str(path) for path in visible}:
+        visible.insert(0, Path(keep))
+option_strings = [str(path) for path in visible]
+
+
+def _open_game_for(picked_paths: list[str]):
+    """The first picked recording that belongs to a game, and that game; ``(None, None)`` when none does.
+
+    A game's manifest stores its clips beside the footage, so any clip of the game identifies it: that is how a
+    session finds its game without a separate selection.
+    """
+    for path in picked_paths:
+        found = game_lib.find_for_video(path)
+        if found is not None:
+            return path, found
+    return None, None
+
+
+def _open_analysis_beside_video() -> None:
+    """A single picked video that already has an analysis saved beside it opens that analysis automatically.
+
+    Only while no analysis is selected, and only for a single pick: several picks are a game being assembled,
+    and switching the archive out from under that would fight the user.
+    """
+    if match_id is not None:
+        return
+    picked_now = st.session_state.get(f"game_clips::{match_id}") or []
+    if len(picked_now) != 1:
+        return
+    found = _analysis_for_video(str(picked_now[0]))
+    if found:
+        st.session_state["archive_select_pending"] = found
+
+
+# The widget reports its value only after it has been drawn, so before the expander the kept selection from the
+# last run stands in for it - that is what lets the expander know whether a game is already open on the first
+# render. A fresh session starts on the newest video of the folder, and when that video belongs to a game, on
+# the whole game (all its clips) - so the picker and the marking step below agree about what is being worked on.
+stored_picks = st.session_state.get(f"game_clips::{match_id}")
+if stored_picks is not None:
+    seed_picks = list(stored_picks)
+elif match_id is not None or not option_strings:
+    seed_picks = []
+else:
+    seed_picks = [option_strings[0]]
+    found_via_newest = game_lib.find_for_video(option_strings[0])
+    if found_via_newest is not None:
+        in_options = set(option_strings)
+        seed_picks = [str(clip.path) for clip in found_via_newest.clips if str(clip.path) in in_options] or seed_picks
+if match_id is not None:
+    _seed_source = pinned_source or (seed_picks[0] if seed_picks else None)
+    game_record = game_lib.find_for_video(_seed_source) if _seed_source else None
+else:
+    _seed_source, game_record = _open_game_for(seed_picks)
 game_window_selection: str | None = None
 
-with st.expander("Game clips (no merging needed)", expanded=game_record is None):
+with st.expander("Footage (one video, or the game's clips)", expanded=game_record is None):
     st.caption(
-        "A game usually arrives as two or three camera files. Pick them here and the game is ready in an "
-        "instant: the manifest records the clips and their order, and every reader - marking, analysis, frame "
-        "grabs - resolves the game clock to the right clip directly. Nothing is copied or re-encoded, and no "
-        "merged video is produced."
+        "Pick one recording to analyze it as it stands, or all of a game's camera files - in any order, their "
+        "own timestamps put them in playing order. The game is ready in an instant: the manifest records the "
+        "chosen clips, and every reader - marking, analysis, frame grabs - resolves the game clock to the right "
+        "clip directly. Nothing is copied or re-encoded, and no merged video is produced."
     )
     picked_clips = st.multiselect(
-        "Clips (any order - the camera's own timestamps put them in playing order)",
-        [str(path) for path in video_options],
-        format_func=lambda path: Path(path).name,
+        "Videos (newest first)",
+        option_strings,
+        default=seed_picks,
+        format_func=_video_label,
         key=f"game_clips::{match_id}",
+        on_change=_open_analysis_beside_video,
+        help=(
+            "Videos found under the footage roots, newest first; the folder above narrows the list. One that "
+            "already has an analysis (marked `- analysis saved`) or belongs to a game opens it when picked."
+        ),
     )
     if not picked_clips:
         st.info("Pick at least one clip.")
@@ -2708,9 +2697,69 @@ with st.expander("Game clips (no merging needed)", expanded=game_record is None)
                 st.error(f"The build failed: {build_state.get('error')}")
             elif (expected_dir / game_lib.MANIFEST_FILE).exists():
                 st.success(
-                    f"Game ready: {len(planned_game.clips)} clip(s), {total_minutes:.0f} min. Pick any of its "
-                    "clips in the video list above (the game is recognized from it), then mark the clock below."
+                    f"Game ready: {len(planned_game.clips)} clip(s), {total_minutes:.0f} min. The game is "
+                    "recognized from any of its clips; mark the clock on it below."
                 )
+
+# What the page works on, now that the picker above has reported: the open match's footage, or the picked
+# videos - the first pick that belongs to a game (any clip identifies its game), else the first pick itself. A
+# pasted path wins outright, as it always did. Until the widget has drawn once, the kept selection from the last
+# run stood in for it above, so the expander already knew whether a game was open.
+manual_path = manual.strip()
+if manual_path:
+    chosen = manual_path
+    game_record = game_lib.find_for_video(chosen)
+elif match_id is not None:
+    chosen = pinned_source or (list(picked_clips)[0] if picked_clips else option_strings[0])
+    game_record = game_lib.find_for_video(chosen)
+else:
+    chosen, game_record = _open_game_for(list(picked_clips))
+    if chosen is None:
+        chosen = list(picked_clips)[0] if picked_clips else option_strings[0]
+if not Path(chosen).exists():
+    st.error("File not found.")
+    st.stop()
+probe = probe_cached(chosen)
+
+# Two states with nothing to analyze yet, each said in one line below: several videos picked but no game made
+# (the button above is the missing step), or nothing picked at all.
+game_pending = manual_path == "" and match_id is None and len(picked_clips) > 1 and game_record is None
+no_pick = manual_path == "" and match_id is None and not picked_clips
+
+# Starting the session: the match record beside the footage, which is where every later step stores its results.
+# It is created by the button here - or automatically by the first Run analysis - and it is re-opened by picking
+# a video that has one (or any clip of a game that has one).
+if match_id is None and not game_pending and not no_pick:
+    analysis_home = game_lib.manifest_dir(game_record) if game_record is not None else analysis_dir_for(chosen)
+    st.caption(
+        f"Starting an analysis saves it with the footage: `{_location_label(analysis_home)}` - everything later "
+        "lands in that folder."
+    )
+
+    def _create_match() -> None:
+        """Runs before the next run's body, so this module picks the new analysis up in that same run."""
+        source = str(game_record.output) if game_record is not None else chosen
+        existing = _analysis_for_video(source)
+        record = library.create(source)
+        st.session_state["archive_select_pending"] = record.match_id
+        st.session_state["session_flash"] = (
+            "success",
+            f"`{record.match_id}` already had an analysis beside the footage - opened it rather than starting "
+            "a second one."
+            if existing
+            else f"`{record.match_id}` started - saved with the footage in "
+            f"`{_location_label(library.path(record.match_id))}`.",
+        )
+
+    st.button(
+        "Start a match analysis for this footage",
+        type="primary",
+        on_click=_create_match,
+        help=(
+            "Writes the match record into an `analysis/` folder beside the video. Every later step stores its "
+            "results there too, so copying the match folder carries the whole analysis with it."
+        ),
+    )
 
 if game_record is not None:
     game_directory = game_lib.manifest_dir(game_record)
@@ -2831,43 +2880,6 @@ if game_record is not None:
             game_record.save(game_directory)
             st.rerun()
 
-span_col, length_col = st.columns(2)
-# A marked game starts on kick-off rather than at the top of the recording - that is the point of marking it - and
-# the window radio above overwrites these two when another window is picked.
-game_marks = game_record.bounds() if game_record is not None else None
-with span_col:
-    # Keyed by video: the segment belongs to the footage, so one match's analysis window must not become the next
-    # one's. A leftover offset would silently analyze the wrong part of a different match.
-    start_s = st.number_input(
-        "Start offset (s)",
-        min_value=0.0,
-        value=0.0 if game_marks is None else float(game_marks[0]),
-        step=30.0,
-        key=f"start_s::{chosen}",
-    )
-with length_col:
-    duration_s = st.number_input(
-        "Length to analyze (s)",
-        min_value=0.0,
-        value=0.0 if game_marks is None else float(game_marks[2] - game_marks[0]),
-        step=30.0,
-        key=f"length_s::{chosen}",
-        help="0 analyzes from the offset to the end of the video; a marked game defaults to kick-off to full-time.",
-    )
-
-window_start, window_end = resolve_window(start_s, duration_s, probe.duration_s)
-st.caption(
-    f"Analyzing **{_clock(window_start)} to {_clock(window_end)}** "
-    f"({window_end - window_start:.0f} s"
-    + (", the entire video from the offset" if duration_s <= 0 else "")
-    + ")."
-)
-if game_marks is not None:
-    st.caption(
-        f"Game clock: kick-off {_clock(game_marks[0])}, half-time {_clock(game_marks[1])}, full-time "
-        f"{_clock(game_marks[2])}. Events and the report are labeled by half."
-    )
-
 # A game is analyzed from its manifest, not from any one clip: the picked clip only identifies the game here,
 # and the manifest carries the clip offsets the reader resolves. A plain video is analyzed as itself, as before.
 analysis_source = (
@@ -2896,82 +2908,138 @@ if meta_file.exists():
     except (OSError, json.JSONDecodeError):
         existing_meta = None
 
-
-def _same_window(meta: dict) -> bool:
-    """Whether the results already in the output directory cover exactly the requested window."""
-    return (
-        abs(float(meta.get("start_s", -1.0)) - window_start) < 1e-6
-        and abs(float(meta.get("end_s", -1.0)) - window_end) < 1e-6
+if game_pending:
+    st.info(
+        "These clips are not one game yet - press **Use these clips as one game** above: the analysis then runs "
+        "on the whole game, because every later step needs one clock."
     )
-
-
-window_conflict = existing_meta is not None and not _same_window(existing_meta)
-fps_conflict = existing_meta is not None and abs(float(existing_meta.get("fps", config.fps)) - config.fps) > 1e-6
-# Detection defaults to the source's own width now (the launch below passes no --width), and `analyze_segment`
-# refuses to resume results from another width into one directory - so a width mismatch supersedes like a window
-# or rate one. A meta without `detect_width` predates the full-resolution default: it was analyzed at 1920.
-stored_width = int(existing_meta.get("detect_width", 1920)) if existing_meta is not None else 0
-width_conflict = existing_meta is not None and stored_width != int(probe.width)
-
-info_col, run_col = st.columns([2, 1])
-with info_col:
-    if window_conflict or fps_conflict or width_conflict:
-        stored = (
-            f"{_clock(float(existing_meta['start_s']))} to {_clock(float(existing_meta['end_s']))} "
-            f"at {float(existing_meta.get('fps', 5.0)):g} fps, detected at {stored_width} px"
+elif no_pick:
+    st.info("Pick the video to analyze (or the game's clips) above.")
+else:
+    span_col, length_col = st.columns(2)
+    # A marked game starts on kick-off rather than at the top of the recording - that is the point of marking it -
+    # and the window radio above overwrites these two when another window is picked.
+    game_marks = game_record.bounds() if game_record is not None else None
+    with span_col:
+        # Keyed by video: the segment belongs to the footage, so one match's analysis window must not become the
+        # next one's. A leftover offset would silently analyze the wrong part of a different match.
+        start_s = st.number_input(
+            "Start offset (s)",
+            min_value=0.0,
+            value=0.0 if game_marks is None else float(game_marks[0]),
+            step=30.0,
+            key=f"start_s::{chosen}",
         )
-        st.warning(
-            f"This video already has results for **{stored}**. There is one output directory per video, and a "
-            "different window, analysis rate or detection width cannot be resumed into the same one - running "
-            f"again (this run: {_clock(window_start)} to {_clock(window_end)} at {config.fps:g} fps, detecting "
-            f"at the source's own {int(probe.width)} px) will move the existing results aside (renamed, not "
-            "deleted)."
+    with length_col:
+        duration_s = st.number_input(
+            "Length to analyze (s)",
+            min_value=0.0,
+            value=0.0 if game_marks is None else float(game_marks[2] - game_marks[0]),
+            step=30.0,
+            key=f"length_s::{chosen}",
+            help="0 analyzes from the offset to the end of the video; a marked game defaults to kick-off to full-time.",
         )
-    _stage_a_status(segment_dir, watch_key=f"stage_a_watch::{chosen}")
-with run_col:
-    def _run_analysis() -> None:
-        """Spawn the pass from the callback, which runs before the page is drawn again - one run, not two."""
-        archived_note = ""
-        if existing_meta is not None and (not _same_window(existing_meta) or fps_conflict or width_conflict):
-            # `analyze_segment` refuses to mix windows, analysis rates or detection widths in one output
-            # directory, so the old results move aside under a timestamped name. Renaming (rather than deleting)
-            # means putting the earlier analysis back is a rename away, which matters because re-analysis of the
-            # same footage is what created the conflict.
-            archived = segment_dir.with_name(f"{segment_dir.name}_superseded_{time.strftime('%Y%m%d_%H%M%S')}")
-            segment_dir.rename(archived)
-            archived_note = f" The previous results are at `{_location_label(archived)}`."
-        saved_note = ""
-        record_id = match_id
-        if record_id is None:
-            # Starting the pass starts the analysis, and the analysis lives with the footage: there is no
-            # separate save step to forget, and no segment can end up orphaned in the repository.
-            # A game's directory comes from its manifest's own output name (where the merge would have gone),
-            # which is exactly where the manifest already sits.
-            record = library.create(str(game_record.output) if game_record is not None else chosen)
-            record_id = record.match_id
-            st.session_state["archive_select_pending"] = record_id
-            saved_note = (
-                f" Saved with the footage in `{_location_label(library.path(record_id))}`."
+
+    # The window is on the source's clock: for a game that is the whole game (all its clips, one clock), for a
+    # plain recording its own length. A marked game overwrites both inputs with kick-off to full-time anyway.
+    window_limit = float(game_record.duration_s) if game_record is not None else probe.duration_s
+    window_start, window_end = resolve_window(start_s, duration_s, window_limit)
+    st.caption(
+        f"Analyzing **{_clock(window_start)} to {_clock(window_end)}** "
+        f"({window_end - window_start:.0f} s"
+        + (", the entire video from the offset" if duration_s <= 0 else "")
+        + ")."
+    )
+    if game_record is not None:
+        st.caption(
+            f"Source: the whole game - {len(game_record.clips)} clip(s), {game_record.duration_s / 60:.0f} min "
+            f"({probe.width}x{probe.height}, {probe.fps:.0f} fps)."
+        )
+    else:
+        st.caption(
+            f"Source: `{_location_label(Path(chosen))}` - {probe.width}x{probe.height}, {probe.fps:.0f} fps, "
+            f"{probe.duration_s / 60:.1f} min."
+        )
+    if game_marks is not None:
+        st.caption(
+            f"Game clock: kick-off {_clock(game_marks[0])}, half-time {_clock(game_marks[1])}, full-time "
+            f"{_clock(game_marks[2])}. Events and the report are labeled by half."
+        )
+
+    def _same_window(meta: dict) -> bool:
+        """Whether the results already in the output directory cover exactly the requested window."""
+        return (
+            abs(float(meta.get("start_s", -1.0)) - window_start) < 1e-6
+            and abs(float(meta.get("end_s", -1.0)) - window_end) < 1e-6
+        )
+
+    window_conflict = existing_meta is not None and not _same_window(existing_meta)
+    fps_conflict = existing_meta is not None and abs(float(existing_meta.get("fps", config.fps)) - config.fps) > 1e-6
+    # Detection defaults to the source's own width now (the launch below passes no --width), and `analyze_segment`
+    # refuses to resume results from another width into one directory - so a width mismatch supersedes like a window
+    # or rate one. A meta without `detect_width` predates the full-resolution default: it was analyzed at 1920.
+    stored_width = int(existing_meta.get("detect_width", 1920)) if existing_meta is not None else 0
+    width_conflict = existing_meta is not None and stored_width != int(probe.width)
+
+    info_col, run_col = st.columns([2, 1])
+    with info_col:
+        if window_conflict or fps_conflict or width_conflict:
+            stored = (
+                f"{_clock(float(existing_meta['start_s']))} to {_clock(float(existing_meta['end_s']))} "
+                f"at {float(existing_meta.get('fps', 5.0)):g} fps, detected at {stored_width} px"
             )
-        # The match record keeps the segment list, which is what `summaries` and the rebuild scripts read.
-        library.add_segment(record_id, segment_dir)
-        # No --width: the pass detects at the source's own width, the full-resolution default. A saved segment
-        # from the old 1920 default was superseded above, so the run cannot collide with it.
-        command = [
-            sys.executable,
-            str(REPO_ROOT / "scripts" / "run_stage_a.py"),
-            "--video", analysis_source,
-            "--out", str(segment_dir),
-            "--start", str(start_s),
-            "--duration", str(duration_s),
-        ]
-        subprocess.Popen(command, cwd=str(REPO_ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        st.session_state["step1_flash"] = (
-            "success",
-            "Analysis started in the background - progress updates here automatically." + saved_note + archived_note,
-        )
+            st.warning(
+                f"This video already has results for **{stored}**. There is one output directory per video, and a "
+                "different window, analysis rate or detection width cannot be resumed into the same one - running "
+                f"again (this run: {_clock(window_start)} to {_clock(window_end)} at {config.fps:g} fps, detecting "
+                f"at the source's own {int(probe.width)} px) will move the existing results aside (renamed, not "
+                "deleted)."
+            )
+        _stage_a_status(segment_dir, watch_key=f"stage_a_watch::{chosen}")
+    with run_col:
+        def _run_analysis() -> None:
+            """Spawn the pass from the callback, which runs before the page is drawn again - one run, not two."""
+            archived_note = ""
+            if existing_meta is not None and (not _same_window(existing_meta) or fps_conflict or width_conflict):
+                # `analyze_segment` refuses to mix windows, analysis rates or detection widths in one output
+                # directory, so the old results move aside under a timestamped name. Renaming (rather than deleting)
+                # means putting the earlier analysis back is a rename away, which matters because re-analysis of the
+                # same footage is what created the conflict.
+                archived = segment_dir.with_name(f"{segment_dir.name}_superseded_{time.strftime('%Y%m%d_%H%M%S')}")
+                segment_dir.rename(archived)
+                archived_note = f" The previous results are at `{_location_label(archived)}`."
+            saved_note = ""
+            record_id = match_id
+            if record_id is None:
+                # Starting the pass starts the analysis, and the analysis lives with the footage: there is no
+                # separate save step to forget, and no segment can end up orphaned in the repository.
+                # A game's directory comes from its manifest's own output name (where the merge would have gone),
+                # which is exactly where the manifest already sits.
+                record = library.create(str(game_record.output) if game_record is not None else chosen)
+                record_id = record.match_id
+                st.session_state["archive_select_pending"] = record_id
+                saved_note = (
+                    f" Saved with the footage in `{_location_label(library.path(record_id))}`."
+                )
+            # The match record keeps the segment list, which is what `summaries` and the rebuild scripts read.
+            library.add_segment(record_id, segment_dir)
+            # No --width: the pass detects at the source's own width, the full-resolution default. A saved segment
+            # from the old 1920 default was superseded above, so the run cannot collide with it.
+            command = [
+                sys.executable,
+                str(REPO_ROOT / "scripts" / "run_stage_a.py"),
+                "--video", analysis_source,
+                "--out", str(segment_dir),
+                "--start", str(start_s),
+                "--duration", str(duration_s),
+            ]
+            subprocess.Popen(command, cwd=str(REPO_ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            st.session_state["step1_flash"] = (
+                "success",
+                "Analysis started in the background - progress updates here automatically." + saved_note + archived_note,
+            )
 
-    st.button("Run analysis (background)", type="primary", on_click=_run_analysis)
+        st.button("Run analysis (background)", type="primary", on_click=_run_analysis)
 
 # --------------------------------------------------------------------------------------------------------------
 # Step 2 - pitch registration

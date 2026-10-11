@@ -37,7 +37,7 @@ def test_dashboard_renders_without_error() -> None:
         pytest.skip("no footage available in this environment")
     headers = [h.value for h in app.header]
     assert any("Step 1" in h for h in headers)
-    assert any("Video (newest first)" == s.label for s in app.selectbox)
+    assert any("Videos (newest first)" == m.label for m in app.multiselect)
 
 
 def test_dashboard_offers_the_next_step_either_way() -> None:
@@ -87,14 +87,15 @@ def test_the_unique_players_panel_renders_when_a_report_exists() -> None:
     app.run()
     if _no_footage(app):
         pytest.skip("no footage available in this environment")
-    video_box = next((s for s in app.selectbox if s.label == "Video (newest first)"), None)
-    if video_box is None:
-        pytest.skip("the page did not offer a video to analyze")
-    # The segment for the combined game is the one the whole pipeline runs on; a single camera clip has none.
-    game = next((option for option in video_box.options if "game_" in str(option)), None)
+    clip_box = next((m for m in app.multiselect if m.label == "Videos (newest first)"), None)
+    if clip_box is None:
+        pytest.skip("the page did not offer footage to analyze")
+    # The session's footage is picked in Step 1 now; the segment for the combined game is the one the whole
+    # pipeline runs on, and any of its clips opens it.
+    game = next((option for option in clip_box.options if "game_" in str(option)), None)
     if game is None:
         pytest.skip("no combined game video on this machine")
-    video_box.set_value(game)
+    clip_box.set_value([game])
     app.run()
     assert not app.exception, [str(e.value) for e in app.exception]
     labels = [expander.label for expander in app.expander]
