@@ -109,6 +109,15 @@ def _atempo_chain(rate: float) -> str:
     return ",".join(stages)
 
 
+def encoder_quality_args(encoder: str, *, live: bool = False) -> list[str]:
+    """Quality/rate-control flags for an encoder, shared by the raw-frame and direct-ffmpeg export paths."""
+    if encoder.endswith("nvenc"):
+        return ["-preset", "p4", "-tune", "ll" if live else "hq", "-rc", "vbr", "-cq", "23"]
+    if "265" in encoder or "hevc" in encoder:
+        return ["-preset", "veryfast" if live else "medium", "-crf", "25"]
+    return ["-preset", "veryfast" if live else "medium", "-crf", "20"]
+
+
 def encoder_command(
     *,
     width: int,
@@ -145,12 +154,7 @@ def encoder_command(
     like the single source; several are stitched by ffmpeg's ``concat`` filter (video is piped, so only the
     sound is chained) and then retimed as a whole, so a join costs no second encoder and no time jump.
     """
-    if encoder.endswith("nvenc"):
-        quality = ["-preset", "p4", "-tune", "ll" if live else "hq", "-rc", "vbr", "-cq", "23"]
-    elif "265" in encoder or "hevc" in encoder:
-        quality = ["-preset", "veryfast" if live else "medium", "-crf", "25"]
-    else:
-        quality = ["-preset", "veryfast" if live else "medium", "-crf", "20"]
+    quality = encoder_quality_args(encoder, live=live)
     pieces = list(audio_inputs or [])
     if not pieces and audio and source is not None:
         legacy_duration = 0.0 if audio_duration_s is None else float(audio_duration_s)

@@ -702,6 +702,93 @@ def _build_report_and_replay(
 
 
 DETECTIONS_STATUS_FILE = "detections.json"  # written by scripts/run_detections.py
+VIDEO_EXPORT_STATUS_FILE = "video_export.json"  # written by scripts/run_video_export.py
+
+
+def _video_export_status(library: MatchLibrary, match_id: str) -> dict:
+    """The match-video export's status file beside the match; {} until it has ever run."""
+    try:
+        return json.loads((library.path(match_id) / VIDEO_EXPORT_STATUS_FILE).read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _video_export_alive(library: MatchLibrary, match_id: str) -> bool:
+    """Whether a video export is running right now, not just leaving "running" behind after a crash."""
+    return _scan_alive(_video_export_status(library, match_id))
+
+
+def _start_video_export(
+    library: MatchLibrary,
+    match_id: str,
+    segment_dir: Path,
+    source: str,
+    output: Path,
+    *,
+    width: int,
+    fps: float,
+    codec: str,
+    team: bool,
+    scoreboard: bool,
+    ball: bool,
+    numbers: bool,
+) -> None:
+    """Start the export as its own process, writing a "Starting..." status before the child boots."""
+    command = [
+        sys.executable,
+        str(REPO_ROOT / "scripts" / "run_video_export.py"),
+        "--match", match_id,
+        "--segment", str(segment_dir),
+        "--source", str(source),
+        "--output", str(output),
+        "--width", str(int(width)),
+        "--fps", f"{float(fps):g}",
+        "--codec", codec,
+    ]
+    if team:
+        command.append("--team")
+    if scoreboard:
+        command.append("--scoreboard")
+    if ball:
+        command.append("--ball")
+    if numbers:
+        command.append("--numbers")
+    overlays = {
+        "team": bool(team),
+        "scoreboard": bool(scoreboard),
+        "ball": bool(ball),
+        "numbers": bool(numbers),
+    }
+    status_path = library.path(match_id) / VIDEO_EXPORT_STATUS_FILE
+    try:
+        status_path.write_text(
+            json.dumps(
+                {
+                    "state": "running",
+                    "stage": "prepare",
+                    "progress": 0.0,
+                    "message": "Starting...",
+                    "output": str(output),
+                    "width": int(width),
+                    "fps": float(fps),
+                    "codec": codec,
+                    "overlays": overlays,
+                    "started": time.time(),
+                    "updated": time.time(),
+                }
+            )
+        )
+    except OSError:
+        pass  # an unwritable match directory fails the child too, and its error lands in its status
+    try:
+        subprocess.Popen(command, cwd=str(REPO_ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as exc:  # e.g. the interpreter vanished between the page load and the click
+        try:
+            status_path.write_text(
+                json.dumps({"state": "error", "message": f"could not start: {exc}", "updated": time.time()})
+            )
+        except OSError:
+            pass
 
 
 def _detections_status(library: MatchLibrary, match_id: str) -> dict:
@@ -3965,6 +4052,184 @@ else:
         replay_section(library, match_id, segment, segment_dir, chosen, calibration)
         for note in payload["notes"]:
             st.caption(f"- {note}")
+
+
+# --------------------------------------------------------------------------------------------------------------
+# Step 4 - export the match video
+# --------------------------------------------------------------------------------------------------------------
+
+
+@st.fragment(run_every=POLL_SECONDS)
+def _video_export_progress(library: MatchLibrary, match_id: str) -> None:
+    """Live state of the background export; a finished/failed run is terminal until the next press."""
+    status = _video_export_status(library, match_id)
+    if not status:
+        return
+    state = str(status.get("state") or "")
+    watch_key = f"video_export_watch::{match_id}"
+    previous = st.session_state.get(watch_key)
+    st.session_state[watch_key] = state
+    if state == "running":
+        progress = float(status.get("progress") or 0.0)
+        st.progress(min(1.0, max(0.0, progress)), text=str(status.get("message") or "Exporting..."))
+        if not _video_export_alive(library, match_id):
+            st.warning(
+                "The export process has not reported for several minutes, so it looks stopped. Press Export to "
+                "start it again."
+            )
+    elif state == "done":
+        output = Path(str(status.get("output") or ""))
+        size = int(status.get("bytes") or (output.stat().st_size if output.exists() else 0))
+        if size >= 1e9:
+            size_label = f"{size / 1e9:.2f} GB"
+        elif size:
+            size_label = f"{size / 1e6:.1f} MB"
+        else:
+            size_label = ""
+        st.success(f"Export ready: `{_location_label(output)}`" + (f" - {size_label}" if size_label else ""))
+    elif state == "error":
+        st.error(f"Export failed: {status.get('message') or 'unknown error'}")
+        details = str(status.get("error") or "").strip()
+        if details:
+            with st.expander("Error details"):
+                st.code(details)
+    if previous == "running" and state != "running":
+        st.rerun()
+
+
+def video_export_section(
+    library: MatchLibrary,
+    match_id: str | None,
+    segment,
+    segment_dir: Path | None,
+    source: str | None,
+    probe,
+) -> None:
+    """The final workflow step: write the whole analyzed match to one MP4."""
+    st.divider()
+    st.header("Export the match video")
+    if match_id is None or segment is None or segment_dir is None or not source:
+        st.info("Select an analyzed match and finish Step 1 first.")
+        return
+
+    match_dir = library.path(match_id)
+    calibration_ready = saved_calibration(library, match_id, expected_source=source) is not None
+    replay_ready = (match_dir / "replay.json").exists() and (match_dir / "boxes.npz").exists()
+    overlay_ready = calibration_ready and replay_ready
+    ball_ready = (Path(segment_dir) / BALL_TRACK_FILE).exists()
+    ball_ready = ball_ready and overlay_ready
+    running = _video_export_alive(library, match_id)
+
+    st.caption(
+        "With every overlay off this is the match as filmed: the analyzed window is re-encoded at the resolution, "
+        "frame rate and codec chosen below. Overlays use the same renderer as the live annotated stream; they take "
+        "longer because every frame is drawn in Python."
+    )
+    overlay_cols = st.columns(4)
+    with overlay_cols[0]:
+        team = st.checkbox(
+            "Team boxes",
+            value=False,
+            key=f"export_team::{match_id}",
+            disabled=not overlay_ready,
+            help=(
+                "Team-coloured boxes around each tracked player. Needs the pitch calibration (Step 2) and a "
+                "built report/replay (Step 3)."
+            ),
+        ) and overlay_ready
+    with overlay_cols[1]:
+        scoreboard = st.checkbox(
+            "Scoreboard",
+            value=False,
+            key=f"export_scoreboard::{match_id}",
+            disabled=not overlay_ready,
+            help=(
+                "Team names, the confirmed-goal score and the match clock. Goals come from confirmed goal "
+                "events; with none it reads 0-0. Needs the pitch calibration (Step 2) and a built report/replay "
+                "(Step 3)."
+            ),
+        ) and overlay_ready
+    with overlay_cols[2]:
+        ball = st.checkbox(
+            "Ball tracker",
+            value=False,
+            key=f"export_ball::{match_id}",
+            disabled=not ball_ready,
+            help=(
+                "Highlights the positions where the ball scan actually detected the ball. Needs the pitch "
+                "calibration, a built report/replay and the ball scan (Step 3)."
+            ),
+        ) and ball_ready
+    with overlay_cols[3]:
+        numbers = st.checkbox(
+            "Jersey numbers",
+            value=False,
+            key=f"export_numbers::{match_id}",
+            disabled=not overlay_ready,
+            help=(
+                "Draws the scanned shirt number or roster name above each tracked player. Needs the report/replay; "
+                "a player with no number and no name has no chip."
+            ),
+        ) and overlay_ready
+    if not overlay_ready:
+        st.caption(
+            "The overlay options need the pitch calibration and a built report. "
+            + ("Register the pitch in Step 2. " if not calibration_ready else "")
+            + ("Build the report in Step 3." if not replay_ready else "")
+        )
+    if not ball_ready:
+        st.caption("The ball tracker needs the ball scan; run it in the Scan activity section of Step 3.")
+
+    option_cols = st.columns(3)
+    with option_cols[0]:
+        resolution = st.selectbox(
+            "Resolution",
+            [
+                f"Source ({probe.width} x {probe.height})",
+                "1080p (1920 x 1080)",
+                "720p (1280 x 720)",
+            ],
+            key=f"export_resolution::{match_id}",
+        )
+    with option_cols[1]:
+        frame_rate = st.selectbox(
+            "Frame rate",
+            [f"Source ({probe.fps:g} fps)", "30 fps", "15 fps", "10 fps"],
+            key=f"export_fps::{match_id}",
+        )
+    with option_cols[2]:
+        codec_label = st.selectbox(
+            "Format",
+            ["H.264 (widely compatible)", "H.265 / HEVC (smaller files)"],
+            key=f"export_codec::{match_id}",
+        )
+    width = probe.width if resolution.startswith("Source") else (1920 if resolution.startswith("1080") else 1280)
+    fps = float(probe.fps) if frame_rate.startswith("Source") else float(frame_rate.split()[0])
+    codec = "h264" if codec_label.startswith("H.264") else "hevc"
+    tags = [
+        name
+        for name, enabled in (("teams", team), ("scoreboard", scoreboard), ("ball", ball), ("numbers", numbers))
+        if enabled
+    ]
+    overlay_tag = "_".join(tags) or "source"
+    resolution_tag = "source" if width == probe.width else f"{width}p"
+    # A plain export at the source size would otherwise say "source" twice.
+    parts = [overlay_tag] if resolution_tag == overlay_tag else [overlay_tag, resolution_tag]
+    output = match_dir / "exports" / f"{match_id}_{'_'.join(parts)}_{fps:g}fps_{codec}.mp4"
+    st.caption(f"Saved under `{_location_label(output.parent)}` as `{output.name}`.")
+
+    st.button(
+        "Export the match video",
+        type="primary",
+        disabled=running,
+        on_click=_start_video_export,
+        args=(library, match_id, segment_dir, source, output, width, fps, codec, team, scoreboard, ball, numbers),
+        help="Runs in the background; progress appears here and the page stays usable.",
+    )
+    _video_export_progress(library, match_id)
+
+
+video_export_section(library, match_id, segment, segment_dir, analysis_source, probe)
 
 
 # --------------------------------------------------------------------------------------------------------------

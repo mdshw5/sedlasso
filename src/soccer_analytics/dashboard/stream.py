@@ -41,6 +41,7 @@ import cv2
 import numpy as np
 
 from soccer_analytics.analysis import game as game_lib
+from soccer_analytics.analysis.events import VERDICT_FALSE
 from soccer_analytics.analysis.identity import numbers_are_stale
 from soccer_analytics.analysis.library import MatchLibrary, MatchRecord, resolve_path
 from soccer_analytics.analysis.projection import segment_poses
@@ -432,6 +433,7 @@ class AnnotatedMatch:
         ball_records: list[dict],
         teams: list[TeamStyle],
         notes: list[str],
+        goals: list[tuple[float, int]] | None = None,
     ):
         self.match_id = match_id
         self.video = Path(video)
@@ -484,6 +486,9 @@ class AnnotatedMatch:
         self.refresh_numbers(numbers, numbers_note)
         self.players_by_frame = players_by_frame
         self.ball = ball_stamps(ball_records, self.frame_count)
+        # (game-clock second, team) for confirmed goals. The scoreboard counts these; an empty list is an honest
+        # 0-0, not an error - most matches have no confirmed goal event at all.
+        self.goals = sorted(goals or [])
 
     def refresh_numbers(self, numbers: dict[int, dict], numbers_note: str | None) -> None:
         """Rebuild the label chips and the numbers note from a fresh assignment (both are edited live).
@@ -567,6 +572,14 @@ class AnnotatedMatch:
         except (OSError, json.JSONDecodeError):
             pass
 
+        goals: list[tuple[float, int]] = []
+        try:
+            for event in library.events(match_id).events:
+                if event.type == "goal" and event.verdict != VERDICT_FALSE and event.team in (0, 1):
+                    goals.append((float(event.time_s), int(event.team)))
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+            goals = []
+
         notes: list[str] = []
         excluded = int(replay.get("bystanders_excluded") or 0)
         if excluded:
@@ -589,10 +602,11 @@ class AnnotatedMatch:
             teams.append(TeamStyle(name=name, bgr=bgr))
 
         # The segment remembers the filming machine's own path for the video it was built from, and a legacy
-        # absolute path outlives the disk it was written on when the archive moves beside its footage. Re-point
-        # it the way the record's sources are: look the stored name up beside the analysis and beside the
-        # footage, and only then accept the record's own resolved source as the fallback.
-        video = str(segment.meta["video"])
+        # absolute path outlives the disk it was written on when the archive moves beside its footage. The
+        # match's own game manifest wins when it exists: it is the never-merged source the dashboard now analyzes,
+        # while the segment's stored path can be the virtual merged output (which never existed).
+        match_manifest = match_dir / game_lib.MANIFEST_FILE
+        video = str(match_manifest) if match_manifest.exists() else str(segment.meta["video"])
         if not Path(video).exists():
             for base in (match_dir, match_dir.parent.parent):
                 candidate = Path(resolve_path(video, base))
@@ -627,6 +641,7 @@ class AnnotatedMatch:
             ball_records=ball_records,
             teams=teams,
             notes=notes,
+            goals=goals,
         )
 
     # ----------------------------------------------------------------------------------------------------------
@@ -635,6 +650,15 @@ class AnnotatedMatch:
     def source_time(self, index: int) -> float:
         """Wall time in the source video for an analysis frame (the segment clock in seconds)."""
         return self.start_s + index / self.fps
+
+    def score_at(self, index: int) -> tuple[int, int]:
+        """The confirmed-goal score at an analysis frame, on the match's own clock."""
+        at = self.source_time(index)
+        score = [0, 0]
+        for time_s, team in self.goals:
+            if time_s <= at:
+                score[team] += 1
+        return score[0], score[1]
 
     def index_for(self, start_s: float) -> int:
         """The first analysis frame at or after a source-clock time, clamped to the analyzed window."""
@@ -722,6 +746,7 @@ class AnnotatedMatch:
         ball: bool = True,
         hud: bool = True,
         debug: bool = True,
+        scoreboard: bool = False,
         note: str = "",
     ) -> np.ndarray:
         """Draw one analysis frame's overlay onto ``frame`` (in place) and return it.
@@ -737,6 +762,8 @@ class AnnotatedMatch:
             self._draw_players(frame, index, boxes=boxes, numbers=numbers, debug=debug)
         if ball:
             self._draw_ball(frame, index)
+        if scoreboard:
+            self._draw_scoreboard(frame, index)
         if hud:
             self._draw_hud(frame, index, note=note, session_line=debug)
         if debug:
@@ -754,6 +781,7 @@ class AnnotatedMatch:
         ball: bool = True,
         hud: bool = True,
         debug: bool = True,
+        scoreboard: bool = False,
         note: str = "",
     ) -> np.ndarray:
         """Draw the overlay for any source-clock time, not only the analysis grid - the full-rate entry point.
@@ -776,6 +804,8 @@ class AnnotatedMatch:
             )
         if ball:
             self._draw_ball(frame, earlier, stamp=self.ball_at(position))
+        if scoreboard:
+            self._draw_scoreboard(frame, earlier)
         if hud:
             self._draw_hud(frame, earlier, note=note, session_line=debug)
         if debug:
@@ -931,6 +961,66 @@ class AnnotatedMatch:
         line = stamp + (f"  {note}" if note else "")
         (tw, _th), _ = cv2.getTextSize(line, FONT, font, 1)
         _outline_text(frame, line, (width - pad - tw, pad + int(18 * scale)), PAPER, font)
+
+    def _draw_scoreboard(self, frame: np.ndarray, index: int) -> None:
+        """A top-centre scoreboard: team names, confirmed score and the match clock.
+
+        The score counts the match's confirmed goal events (manual tags and detected goals a reviewer has not
+        rejected). With no such events it honestly reads 0-0; the scoreboard does not infer goals from the
+        ball scan.
+        """
+        height, width = frame.shape[:2]
+        scale = height / 1080.0
+        name_font = max(0.45, 0.62 * scale)
+        clock_font = max(0.35, 0.45 * scale)
+        names = [style.name for style in self.teams]
+        while len(names) < 2:
+            names.append(f"Team {len(names) + 1}")
+        score = self.score_at(index)
+        line = f"{names[0]}   {score[0]} - {score[1]}   {names[1]}"
+        (line_w, line_h), _ = cv2.getTextSize(line, FONT, name_font, 2)
+        clock = max(0.0, self.source_time(index) - self.start_s)
+        clock_text = f"{int(clock) // 60}:{int(clock) % 60:02d}"
+        (clock_w, clock_h), _ = cv2.getTextSize(clock_text, FONT, clock_font, 1)
+        pad = max(8, int(14 * scale))
+        swatch = max(10, int(18 * scale))
+        panel_w = max(line_w + 4 * pad + 2 * swatch, clock_w + 2 * pad)
+        panel_h = 3 * pad + line_h + clock_h
+        x0 = max(0, (width - panel_w) // 2)
+        y0 = pad
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x0, y0), (x0 + panel_w, y0 + panel_h), (24, 24, 24), -1)
+        cv2.addWeighted(overlay, 0.68, frame, 0.32, 0, frame)
+        left_colour = self.teams[0].bgr if self.teams else FALLBACK_BGR[0]
+        right_colour = self.teams[1].bgr if len(self.teams) > 1 else FALLBACK_BGR[1]
+        cv2.rectangle(frame, (x0 + pad, y0 + pad), (x0 + pad + swatch, y0 + pad + line_h), left_colour, -1)
+        cv2.rectangle(
+            frame,
+            (x0 + panel_w - pad - swatch, y0 + pad),
+            (x0 + panel_w - pad, y0 + pad + line_h),
+            right_colour,
+            -1,
+        )
+        cv2.putText(
+            frame,
+            line,
+            (x0 + 2 * pad + swatch, y0 + pad + line_h),
+            FONT,
+            name_font,
+            PAPER,
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            clock_text,
+            (x0 + (panel_w - clock_w) // 2, y0 + 2 * pad + line_h + clock_h),
+            FONT,
+            clock_font,
+            PAPER,
+            1,
+            cv2.LINE_AA,
+        )
 
     def _draw_debug(self, frame: np.ndarray, index: int) -> None:
         """The diagnosing corners: which session this is (top-left), where in the analysis this frame sits

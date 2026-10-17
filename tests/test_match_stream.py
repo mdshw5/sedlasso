@@ -72,7 +72,7 @@ def stream_case():
     return segment, calibration, q, focal, replay, track_boxes(report.players)
 
 
-def _annotated(stream_case, *, numbers=None, numbers_note=None, ball_records=(), notes=(), players=None, boxes=None, start_s=None) -> AnnotatedMatch:
+def _annotated(stream_case, *, numbers=None, numbers_note=None, ball_records=(), notes=(), players=None, boxes=None, start_s=None, goals=None) -> AnnotatedMatch:
     segment, calibration, q, focal, replay, track_boxes_all = stream_case
     return AnnotatedMatch(
         match_id="synthetic",
@@ -91,7 +91,37 @@ def _annotated(stream_case, *, numbers=None, numbers_note=None, ball_records=(),
         ball_records=list(ball_records),
         teams=[TeamStyle(name="Team A", bgr=(12, 34, 56)), TeamStyle(name="Team B", bgr=(200, 30, 30))],
         notes=list(notes),
+        goals=goals,
     )
+
+
+# --------------------------------------------------------------------------------------------------------------
+# The scoreboard
+# --------------------------------------------------------------------------------------------------------------
+def test_the_scoreboard_counts_confirmed_goals_on_the_match_clock(stream_case) -> None:
+    match = _annotated(stream_case, goals=[(0.0, 0), (5.0, 1)])
+    assert match.score_at(0) in ((1, 0), (0, 0))  # a goal at the very start may sit before/at frame 0
+    just_before = match.index_for(match.start_s + 4.9)
+    at_second = match.index_for(match.start_s + 5.1)
+    assert match.score_at(just_before) == (1, 0)
+    assert match.score_at(at_second) == (1, 1)
+
+
+def test_the_scoreboard_draws_a_panel_without_any_other_layer(stream_case) -> None:
+    match = _annotated(stream_case, goals=[(5.0, 0)])
+    frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+    match.render(
+        frame,
+        0,
+        pitch=False,
+        boxes=False,
+        numbers=False,
+        ball=False,
+        hud=False,
+        debug=False,
+        scoreboard=True,
+    )
+    assert frame.any(), "the scoreboard drew nothing"
 
 
 # --------------------------------------------------------------------------------------------------------------
