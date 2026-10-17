@@ -102,6 +102,7 @@ from soccer_analytics.dashboard.pitch_clicks import (
     zoom_box,
 )
 from soccer_analytics.dashboard import timeline
+from soccer_analytics.dashboard.match_state import match_footage
 from soccer_analytics.dashboard.reports import (
     DEFAULT_TEAM_NAMES,
     colors_were_recorded,
@@ -1119,16 +1120,30 @@ def _stage_a_status(segment_dir: Path, watch_key: str) -> None:
         st.rerun()
 
 
-def saved_calibration(library: MatchLibrary, match_id: str | None) -> PitchCalibration | None:
+def saved_calibration(
+    library: MatchLibrary,
+    match_id: str | None,
+    *,
+    expected_source: str | None = None,
+) -> PitchCalibration | None:
     """The calibration for this match: whatever was just clicked, else whatever is on disk.
 
     Returns None when there is no match selected, which is the normal state on a first visit to the page.
+
+    When ``expected_source`` is given and the saved clicks name a different recording, the saved fit is not
+    returned. Its clicks are frame-indexed into that other recording, so projecting it through this match's chain
+    would draw a confidently wrong overlay - the numbers look healthy because the clicks agree with each other,
+    just on the wrong pictures.
     """
     pending = st.session_state.get("calibration")
     if pending:
         return PitchCalibration.from_json(pending)
     if match_id is None:
         return None
+    clicks_source = library.load_clicks_source(match_id)
+    if expected_source is not None and clicks_source is not None:
+        if Path(clicks_source).resolve() != Path(expected_source).resolve():
+            return None
     return library.load_calibration(match_id)
 
 
@@ -2501,7 +2516,9 @@ with st.container(border=True):
             ),
         )
         match_id = None if selection == "(new analysis)" else selection
-        if st.session_state.get("archive_scope") != match_id:
+        previous_scope = st.session_state.get("archive_scope")
+        just_selected = match_id is not None and previous_scope != match_id
+        if previous_scope != match_id:
             st.session_state["archive_scope"] = match_id
             for scoped in MATCH_SCOPED_STATE:
                 st.session_state.pop(scoped, None)
@@ -2519,14 +2536,20 @@ with st.container(border=True):
         # moved still opens its own video.
         pinned_source: str | None = None
         default_video_folder = "All folders"
-        if match_id is not None:
-            recorded = library.load(match_id).sources
-            reachable = [source for source in recorded if Path(source).exists()]
-            if reachable:
-                pinned_source = str(Path(reachable[0]))
-                default_video_folder = str(Path(reachable[0]).parent)
-            elif recorded:
-                st.warning("The footage this match was recorded from is not reachable: " + ", ".join(recorded))
+        match = match_footage(library, match_id) if match_id is not None else None
+        if match is not None:
+            if match.videos:
+                pinned_source = match.videos[0]
+                default_video_folder = str(Path(match.videos[0]).parent)
+            if match.missing:
+                st.warning(
+                    "Some footage this match used is not reachable: "
+                    + ", ".join(Path(path).name for path in match.missing)
+                )
+            # Seed the picker on selection, before its widget is created: an existing match reopens with the
+            # exact recordings it was built from (a game's clips, not the virtual merged output name).
+            if just_selected:
+                st.session_state[f"game_clips::{match_id}"] = list(match.videos)
 
         # The recordings live in one folder per match (and matches for several teams sit side by side), so the
         # folder narrows Step 1's video list instead of scrolling one flat list from every disk.
@@ -2535,6 +2558,9 @@ with st.container(border=True):
         folder_index = (
             folder_choices.index(default_video_folder) if default_video_folder in folder_choices else 0
         )
+        # A widget's stored value survives a match switch, so put the match's own folder back on selection.
+        if just_selected and default_video_folder in folder_choices:
+            st.session_state[f"video_folder::{match_id}"] = default_video_folder
         folder = st.selectbox(
             "Folder",
             folder_choices,
@@ -2625,8 +2651,14 @@ else:
         in_options = set(option_strings)
         seed_picks = [str(clip.path) for clip in found_via_newest.clips if str(clip.path) in in_options] or seed_picks
 if match_id is not None:
-    _seed_source = pinned_source or (seed_picks[0] if seed_picks else None)
-    game_record = game_lib.find_for_video(_seed_source) if _seed_source else None
+    game_record = match.game if match is not None else None
+    _seed_source = (
+        (match.analysis_source if match is not None else None)
+        or pinned_source
+        or (seed_picks[0] if seed_picks else None)
+    )
+    if game_record is None and _seed_source:
+        game_record = game_lib.find_for_video(_seed_source)
 else:
     _seed_source, game_record = _open_game_for(seed_picks)
 game_window_selection: str | None = None
@@ -2724,7 +2756,11 @@ if manual_path:
     chosen = manual_path
     game_record = game_lib.find_for_video(chosen)
 elif match_id is not None:
-    chosen = pinned_source or (list(picked_clips)[0] if picked_clips else option_strings[0])
+    chosen = (
+        (match.analysis_source if match is not None else None)
+        or pinned_source
+        or (list(picked_clips)[0] if picked_clips else option_strings[0])
+    )
     game_record = game_lib.find_for_video(chosen)
 else:
     chosen, game_record = _open_game_for(list(picked_clips))
@@ -2866,6 +2902,15 @@ if game_record is not None:
     )
     if game_record.bounds() is not None:
         window_key = f"game_window::{game_record.game_id}"
+        # A reopened match should show the window it was analyzed with. When that window is one of the three
+        # standard choices, put the radio on it; a custom saved window is restored into the number inputs below.
+        if just_selected and match is not None and match.window is not None:
+            saved_start, saved_end = match.window
+            for choice in game_lib.WINDOW_CHOICES:
+                start, end = game_record.window(choice)
+                if abs(start - saved_start) < 1e-6 and abs(end - saved_end) < 1e-6:
+                    st.session_state[window_key] = choice
+                    break
 
         def _apply_game_window() -> None:
             selection = str(st.session_state.get(window_key))
@@ -2912,15 +2957,6 @@ segment_dir = segment_dir_for(
     ),
 )
 config = SegmentConfig()
-status = read_status(segment_dir)
-
-existing_meta: dict | None = None
-meta_file = segment_dir / "meta.json"
-if meta_file.exists():
-    try:
-        existing_meta = json.loads(meta_file.read_text())
-    except (OSError, json.JSONDecodeError):
-        existing_meta = None
 
 if game_pending:
     st.info(
@@ -2934,6 +2970,11 @@ else:
     # A marked game starts on kick-off rather than at the top of the recording - that is the point of marking it -
     # and the window radio above overwrites these two when another window is picked.
     game_marks = game_record.bounds() if game_record is not None else None
+    # Restore the saved analysis window on selection, before the inputs exist. This also covers a custom window
+    # that is not one of the standard whole/first-half/second-half choices.
+    if just_selected and match is not None and match.window is not None:
+        st.session_state[f"start_s::{chosen}"] = float(match.window[0])
+        st.session_state[f"length_s::{chosen}"] = float(match.window[1] - match.window[0])
     with span_col:
         # Keyed by video: the segment belongs to the footage, so one match's analysis window must not become the
         # next one's. A leftover offset would silently analyze the wrong part of a different match.
@@ -2958,6 +2999,19 @@ else:
     # plain recording its own length. A marked game overwrites both inputs with kick-off to full-time anyway.
     window_limit = float(game_record.duration_s) if game_record is not None else probe.duration_s
     window_start, window_end = resolve_window(start_s, duration_s, window_limit)
+    # Reuse the exact segment directory the match was analyzed into when the requested window still matches it.
+    # This is what makes a custom saved window resumable even though it has no standard window label.
+    if match_id is not None and match is not None and match.saved_segment and match.window is not None:
+        if abs(match.window[0] - window_start) < 1e-6 and abs(match.window[1] - window_end) < 1e-6:
+            segment_dir = Path(match.saved_segment)
+    status = read_status(segment_dir)
+    existing_meta: dict | None = None
+    meta_file = segment_dir / "meta.json"
+    if meta_file.exists():
+        try:
+            existing_meta = json.loads(meta_file.read_text())
+        except (OSError, json.JSONDecodeError):
+            existing_meta = None
     st.caption(
         f"Analyzing **{_clock(window_start)} to {_clock(window_end)}** "
         f"({window_end - window_start:.0f} s"
@@ -3093,6 +3147,16 @@ if segment is not None:
             "Camera motion is estimated from the picture; it drifts slowly, so clicks spread across the match "
             "re-anchor it. A gimbal log beside the video would remove that drift."
         )
+    saved_click_source = library.load_clicks_source(match_id) if match_id is not None else None
+    if (
+        saved_click_source is not None
+        and Path(saved_click_source).resolve() != Path(analysis_source).resolve()
+    ):
+        st.warning(
+            f"The saved calibration was clicked on `{Path(saved_click_source).name}`, not this match's analyzed "
+            f"footage (`{Path(analysis_source).name}`). It is not loaded here because its clicks are frame-indexed "
+            "into a different recording - recalibrate on the analyzed footage."
+        )
     # The pitch size lives on the match record, not in a widget: the calibration was clicked against those
     # dimensions, so reading them back from the record is what stops the two drifting apart across reloads.
     record = library.load(match_id)
@@ -3175,8 +3239,8 @@ if segment is not None:
         st.session_state.pop("calibration", None)
         if saved_clicks and saved_source and not same_source:
             st.session_state["calib_restore_note"] = (
-                f"The saved clicks were made on `{Path(saved_source).name}`. Select that video in Step 1 to bring "
-                "them back; they are not restored on a different recording."
+                f"The saved clicks were made on `{Path(saved_source).name}`, not this match's analyzed footage. "
+                "They are not restored against a different recording - recalibrate on the analyzed footage."
             )
     restore_note = st.session_state.pop("calib_restore_note", "")
     if restore_note:
@@ -3310,7 +3374,7 @@ are sure of.
     # down, in the place the user is actually working - which is what shows how far the fit has slid by this moment
     # without leaving the frame being clicked on. Drawn only into the still, so it appears exactly when the
     # viewport is at rest on the crop's frame, the same rule the markers follow.
-    calibration_for_view = saved_calibration(library, match_id)
+    calibration_for_view = saved_calibration(library, match_id, expected_source=analysis_source)
     overlay_on = False
     if calibration_for_view is not None:
         overlay_on = st.checkbox(
@@ -3687,7 +3751,7 @@ are sure of.
     with clear_col:
         st.button("Clear all clicks", on_click=_clear_clicks)
 
-    calibration = saved_calibration(library, match_id)
+    calibration = saved_calibration(library, match_id, expected_source=analysis_source)
     if calibration is not None:
         used = st.session_state.get("calib_landmarks") or library.load_clicks(match_id)
         diagnosis = diagnose_fit(calibration)
@@ -3844,7 +3908,7 @@ are sure of.
 st.header("Step 3 - Build the tactical report")
 show_flash("step3_flash")
 
-calibration = saved_calibration(library, match_id)
+calibration = saved_calibration(library, match_id, expected_source=analysis_source)
 if segment is None or calibration is None:
     st.info("Steps 1 and 2 are needed first: the report uses the segment results and the pitch calibration.")
 else:
