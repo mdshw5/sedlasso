@@ -64,7 +64,7 @@ def _rotation_of_step(step: np.ndarray, focal_before: float, focal_after: float)
 
 def _clicks(truth, frames: list[int]) -> list[Landmark]:
     """A perfect user's clicks at the given frames - only what the simulator actually puts on screen."""
-    table = landmark_table(PITCH_LENGTH, PITCH_WIDTH)
+    table = landmark_table(PITCH_LENGTH, PITCH_WIDTH, format_name="9v9")
     land: list[Landmark] = []
     for frame in frames:
         for name, (x, y) in table.items():
@@ -87,7 +87,7 @@ def _median_pixel_error(calibration: PitchCalibration, q: np.ndarray, focal: np.
     landmark that projects through the camera plane is skipped: its "error" is a flip, not a projection.
     """
     errors: list[float] = []
-    table = landmark_table(PITCH_LENGTH, PITCH_WIDTH)
+    table = landmark_table(PITCH_LENGTH, PITCH_WIDTH, format_name="9v9")
     for name, (x, y) in table.items():
         reference, in_front = pitch_to_pixels(
             truth.calibration, np.array([[x, y]]), truth.q[frame], float(truth.focal[frame])

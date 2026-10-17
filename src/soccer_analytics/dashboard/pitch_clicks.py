@@ -27,23 +27,18 @@ import cv2
 import numpy as np
 
 from soccer_analytics.geometry.pitch_calibration import Landmark, PitchCalibration, pitch_to_pixels
+from soccer_analytics.geometry.pitch_markings import markings_for
 
 CLICK_MAX_WIDTH = 1600  # canvas pixels sent to the browser; small crops go at native size, which gives the accuracy
 
-# Standard pitch markings (meters), the same for every format. Kept in one place so the clickable landmarks and the
-# outline drawn back onto the frame cannot drift apart.
-GOAL_WIDTH_M = 7.32  # between the posts, so each post stands 3.66 m either side of the goal center
-GOAL_BOX_DEPTH_M = 5.5
-# The goal area (six-yard box) is 5.5 m out from *each goalpost*, and the posts are 7.32 m apart, so its half-width
-# is 3.66 + 5.5 = 9.16 m - not 5.5 m. Using 5.5 drew a goal box narrower than the real one.
-GOAL_BOX_HALF_WIDTH_M = 9.16
-PENALTY_BOX_DEPTH_M = 16.5
-PENALTY_BOX_HALF_WIDTH_M = 20.16
-PENALTY_SPOT_DISTANCE_M = 11.0
-CENTER_CIRCLE_RADIUS_M = 9.15
+# The fixed markings are per format (see geometry.pitch_markings): a 9v9 pitch has a 13-yard penalty area and a
+# 7-yard centre circle, and the mini-soccer formats have neither a goal area nor a centre circle. The old code used
+# the 11-a-side values for every format, which put the 9v9 penalty area within ~4 m of the centre circle.
 
 
-def landmark_table(length_m: float, width_m: float) -> dict[str, tuple[float, float]]:
+def landmark_table(
+    length_m: float, width_m: float, *, format_name: str | None = None
+) -> dict[str, tuple[float, float]]:
     """Pitch landmarks a user can click, in the order they should be clicked.
 
     Corners first because they spread the fit across the pitch, then the goalposts - which matter because the near
@@ -51,84 +46,122 @@ def landmark_table(length_m: float, width_m: float) -> dict[str, tuple[float, fl
     line and center spot then pin the middle down.
 
     The rest are the markings that are *usually* visible and add spread where the corners cannot: the penalty
-    spots, and the four cardinals of the center circle. They are the same standard markings for every format, so
-    the same list works once the dimensions are known - and because they sit at a range of distances from the
-    camera they are exactly the near landmarks the fit is short of when the near corners are out of shot. The
-    center circle is drawn from the halfway line, so a click on any of them is a measurement of the pitch, not of
-    the camera.
+    spots, and the four cardinals of the center circle. Their positions come from the format's own marking spec
+    (see geometry.pitch_markings), so a 9v9 click on the 7-yard circle is measured against 7 yards, not against the
+    11-a-side 9.15 m circle. The mini-soccer formats have no centre circle, so those landmarks are omitted rather
+    than offered against a marking that is not on the pitch.
 
-    The boxes are deliberately *not* clickable. The goal box (six-yard box) is the hardest marking on the pitch to
-    place accurately - the box is small, its lines are lost against the netting and the goal frame - and the
-    penalty box corners are little better: the corner is a bare junction of two lines with nothing to focus on, so
-    a click a meter out is a meter of error in the fit. The posts carry that end of the pitch instead, and the
-    penalty spots pin the box's depth.
+    The boxes are deliberately *not* clickable. The goal area is the hardest marking on the pitch to place
+    accurately - the box is small, its lines are lost against the netting and the goal frame - and the penalty
+    area corners are little better: the corner is a bare junction of two lines with nothing to focus on, so a click
+    a meter out is a meter of error in the fit. The posts carry that end of the pitch instead, and the penalty
+    spots pin the box's depth.
     """
+    markings = markings_for(format_name)
     half_length = length_m / 2
     half_width = width_m / 2
-    half_goal = GOAL_WIDTH_M / 2
-    return {
+    half_goal = markings.goal_half_width_m
+    table: dict[str, tuple[float, float]] = {
         "corner near-left": (0.0, 0.0),
         "corner near-right": (length_m, 0.0),
         "corner far-right": (length_m, width_m),
         "corner far-left": (0.0, width_m),
         # The posts, not the goal center: the base of a post is a hard, high-contrast edge that can be clicked to a
         # pixel, whereas the middle of the goal mouth is a judgment call between two posts - and the posts are what
-        # the goal box is measured from, so they are the more useful pair.
+        # the goal area is measured from, so they are the more useful pair.
         "goal post left-near": (0.0, half_width - half_goal),
         "goal post left-far": (0.0, half_width + half_goal),
         "goal post right-near": (length_m, half_width - half_goal),
         "goal post right-far": (length_m, half_width + half_goal),
         "halfway near": (half_length, 0.0),
         "halfway far": (half_length, width_m),
-        "center spot": (half_length, half_width),
-        # Penalty spots: 11 m out from the goal line, on the goal center line.
-        "penalty spot left": (PENALTY_SPOT_DISTANCE_M, half_width),
-        "penalty spot right": (length_m - PENALTY_SPOT_DISTANCE_M, half_width),
-        # Center circle cardinals: 9.15 m from the center spot, on the halfway line and the center line.
-        "center circle near": (half_length, half_width - CENTER_CIRCLE_RADIUS_M),
-        "center circle far": (half_length, half_width + CENTER_CIRCLE_RADIUS_M),
-        "center circle left": (half_length - CENTER_CIRCLE_RADIUS_M, half_width),
-        "center circle right": (half_length + CENTER_CIRCLE_RADIUS_M, half_width),
     }
+    if markings.has_center_circle:
+        table["center spot"] = (half_length, half_width)
+    # Penalty spots: out from the goal line on the goal center line, by the format's own distance.
+    table["penalty spot left"] = (markings.penalty_spot_distance_m, half_width)
+    table["penalty spot right"] = (length_m - markings.penalty_spot_distance_m, half_width)
+    if markings.has_center_circle:
+        # Center circle cardinals: the format's radius from the center spot, on the halfway and center lines.
+        table["center circle near"] = (half_length, half_width - markings.center_circle_radius_m)
+        table["center circle far"] = (half_length, half_width + markings.center_circle_radius_m)
+        table["center circle left"] = (half_length - markings.center_circle_radius_m, half_width)
+        table["center circle right"] = (half_length + markings.center_circle_radius_m, half_width)
+    return table
 
 
-LANDMARK_HELP: dict[str, str] = {
-    "corner near-left": "Corner flag at the left-hand end, on the touchline nearest the camera.",
-    "corner near-right": "Corner flag at the right-hand end, on the touchline nearest the camera.",
-    "corner far-right": "Corner flag at the right-hand end, on the far touchline - usually the hardest one to click.",
-    "corner far-left": "Corner flag at the left-hand end, on the far touchline.",
-    "goal post left-near": (
+def landmark_help(format_name: str | None = None) -> dict[str, str]:
+    """What each clickable landmark is, using the selected format's own distances.
+
+    The distances matter: a 9v9 penalty spot is 9 yards out, not 11 m, and the posts are 16 feet apart, not 8
+    yards. Telling a user to click "11 m out" on a pitch marked at 9 yards is a measurement instruction that is
+    wrong by two metres.
+    """
+    markings = markings_for(format_name)
+    posts = (
         "The base of the goalpost at the left-hand end, on the near side of the goal - where the post meets the goal "
-        "line. Use the posts when the corner flag is out of frame: a post is a hard vertical edge, far easier to "
-        "click than the middle of the goal mouth."
-    ),
-    "goal post left-far": (
-        "The base of the goalpost at the left-hand end, on the far side of the goal - where the post meets the goal "
-        "line."
-    ),
-    "goal post right-near": (
-        "The base of the goalpost at the right-hand end, on the near side of the goal - where the post meets the "
-        "goal line."
-    ),
-    "goal post right-far": (
-        "The base of the goalpost at the right-hand end, on the far side of the goal - where the post meets the "
-        "goal line."
-    ),
-    "halfway near": "Where the halfway line meets the near touchline.",
-    "halfway far": "Where the halfway line meets the far touchline.",
-    "center spot": "The center spot (or the center of the center circle).",
-    "penalty spot left": "The penalty spot at the left-hand end - 11 m out from the goal line, on the goal center line.",
-    "penalty spot right": "The penalty spot at the right-hand end - 11 m out from the goal line, on the goal center line.",
-    "center circle near": "Where the center circle crosses the center line, on the near side of the halfway line.",
-    "center circle far": "Where the center circle crosses the center line, on the far side of the halfway line.",
-    "center circle left": "Where the center circle crosses the halfway line, on the left-hand side of the center spot.",
-    "center circle right": "Where the center circle crosses the halfway line, on the right-hand side of the center spot.",
-}
+        f"line. The posts are {markings.goal_width_m:.2f} m apart for this format, so the pair also fixes the goal "
+        "line's direction. Use them when the corner flag is out of frame: a post is a hard vertical edge, far "
+        "easier to click than the middle of the goal mouth."
+    )
+    help_text: dict[str, str] = {
+        "corner near-left": "Corner flag at the left-hand end, on the touchline nearest the camera.",
+        "corner near-right": "Corner flag at the right-hand end, on the touchline nearest the camera.",
+        "corner far-right": "Corner flag at the right-hand end, on the far touchline - usually the hardest one to click.",
+        "corner far-left": "Corner flag at the left-hand end, on the far touchline.",
+        "goal post left-near": posts,
+        "goal post left-far": (
+            "The base of the goalpost at the left-hand end, on the far side of the goal - where the post meets the "
+            "goal line."
+        ),
+        "goal post right-near": (
+            "The base of the goalpost at the right-hand end, on the near side of the goal - where the post meets the "
+            "goal line."
+        ),
+        "goal post right-far": (
+            "The base of the goalpost at the right-hand end, on the far side of the goal - where the post meets the "
+            "goal line."
+        ),
+        "halfway near": "Where the halfway line meets the near touchline.",
+        "halfway far": "Where the halfway line meets the far touchline.",
+    }
+    if markings.has_center_circle:
+        help_text["center spot"] = "The center spot (or the center of the center circle)."
+    help_text["penalty spot left"] = (
+        f"The penalty spot at the left-hand end - {markings.penalty_spot_distance_m:.2f} m out from the goal line, "
+        "on the goal center line."
+    )
+    help_text["penalty spot right"] = (
+        f"The penalty spot at the right-hand end - {markings.penalty_spot_distance_m:.2f} m out from the goal line, "
+        "on the goal center line."
+    )
+    if markings.has_center_circle:
+        help_text["center circle near"] = (
+            f"Where the {markings.center_circle_radius_m:.2f} m center circle crosses the center line, on the near "
+            "side of the halfway line."
+        )
+        help_text["center circle far"] = (
+            f"Where the {markings.center_circle_radius_m:.2f} m center circle crosses the center line, on the far "
+            "side of the halfway line."
+        )
+        help_text["center circle left"] = (
+            f"Where the {markings.center_circle_radius_m:.2f} m center circle crosses the halfway line, on the "
+            "left-hand side of the center spot."
+        )
+        help_text["center circle right"] = (
+            f"Where the {markings.center_circle_radius_m:.2f} m center circle crosses the halfway line, on the "
+            "right-hand side of the center spot."
+        )
+    return help_text
 
 
-def pitch_landmark_order(length_m: float, width_m: float) -> list[str]:
+# The 11-a-side wording, kept as a module constant for callers that predate the format-aware helper.
+LANDMARK_HELP: dict[str, str] = landmark_help("11v11")
+
+
+def pitch_landmark_order(length_m: float, width_m: float, *, format_name: str | None = None) -> list[str]:
     """The click order, which is also the order the landmark dropdowns default to."""
-    return list(landmark_table(length_m, width_m))
+    return list(landmark_table(length_m, width_m, format_name=format_name))
 
 
 def zoom_box(width: int, height: int, zoom: float, center_x: float, center_y: float) -> tuple[int, int, int, int]:
@@ -500,14 +533,18 @@ def project_landmarks(
     return projected
 
 
-def pitch_marking_polylines(length_m: float, width_m: float, *, arc_points: int = 48) -> list[np.ndarray]:
+def pitch_marking_polylines(
+    length_m: float, width_m: float, *, format_name: str | None = None, arc_points: int = 48
+) -> list[np.ndarray]:
     """The pitch markings as polylines in pitch meters, for drawing the outline back onto a frame.
 
     Everything is a polyline - circles and arcs are sampled - so the caller only has to project points and draw
     segments. That is what keeps the overlay honest under the perspective projection, where a circle on the ground is
-    not a circle in the image. The markings are the standard ones for every format, so the same shapes work once the
-    dimensions are known.
+    not a circle in the image. The shapes come from the format's own marking spec, not from a single 11-a-side
+    template: a 9v9 pitch has a 13-yard penalty area and a 7-yard centre circle, and the mini-soccer formats have
+    no goal area or centre circle at all.
     """
+    markings = markings_for(format_name)
     half_length, half_width = length_m / 2, width_m / 2
     lines = [
         # Touchlines and goal lines, as one closed loop.
@@ -515,44 +552,57 @@ def pitch_marking_polylines(length_m: float, width_m: float, *, arc_points: int 
         # Halfway line.
         np.array([[half_length, 0.0], [half_length, width_m]]),
     ]
-    # Goal box (six-yard) and penalty box (18-yard) at both ends.
+    # Goal area and penalty area at both ends, using this format's own dimensions.
     for goal_x, inward in ((0.0, 1.0), (length_m, -1.0)):
+        if markings.has_goal_area:
+            lines.append(
+                np.array(
+                    [
+                        [goal_x, half_width - markings.goal_area_half_width_m],
+                        [goal_x + inward * markings.goal_area_depth_m, half_width - markings.goal_area_half_width_m],
+                        [goal_x + inward * markings.goal_area_depth_m, half_width + markings.goal_area_half_width_m],
+                        [goal_x, half_width + markings.goal_area_half_width_m],
+                    ]
+                )
+            )
         lines.append(
             np.array(
                 [
-                    [goal_x, half_width - GOAL_BOX_HALF_WIDTH_M],
-                    [goal_x + inward * GOAL_BOX_DEPTH_M, half_width - GOAL_BOX_HALF_WIDTH_M],
-                    [goal_x + inward * GOAL_BOX_DEPTH_M, half_width + GOAL_BOX_HALF_WIDTH_M],
-                    [goal_x, half_width + GOAL_BOX_HALF_WIDTH_M],
+                    [goal_x, half_width - markings.penalty_area_half_width_m],
+                    [goal_x + inward * markings.penalty_area_depth_m, half_width - markings.penalty_area_half_width_m],
+                    [goal_x + inward * markings.penalty_area_depth_m, half_width + markings.penalty_area_half_width_m],
+                    [goal_x, half_width + markings.penalty_area_half_width_m],
                 ]
             )
         )
-        lines.append(
-            np.array(
-                [
-                    [goal_x, half_width - PENALTY_BOX_HALF_WIDTH_M],
-                    [goal_x + inward * PENALTY_BOX_DEPTH_M, half_width - PENALTY_BOX_HALF_WIDTH_M],
-                    [goal_x + inward * PENALTY_BOX_DEPTH_M, half_width + PENALTY_BOX_HALF_WIDTH_M],
-                    [goal_x, half_width + PENALTY_BOX_HALF_WIDTH_M],
-                ]
-            )
-        )
-    # Center circle.
-    angles = np.linspace(0.0, 2.0 * np.pi, arc_points)
-    lines.append(
-        np.column_stack(
-            [half_length + CENTER_CIRCLE_RADIUS_M * np.cos(angles), half_width + CENTER_CIRCLE_RADIUS_M * np.sin(angles)]
-        )
-    )
-    # Penalty arcs: the part of the 9.15 m circle around each penalty spot that lies outside the penalty box.
-    theta = np.arccos((PENALTY_BOX_DEPTH_M - PENALTY_SPOT_DISTANCE_M) / CENTER_CIRCLE_RADIUS_M)
-    for spot_x, facing in ((PENALTY_SPOT_DISTANCE_M, 0.0), (length_m - PENALTY_SPOT_DISTANCE_M, np.pi)):
-        arc = np.linspace(facing - theta, facing + theta, arc_points)
+    if markings.has_center_circle:
+        angles = np.linspace(0.0, 2.0 * np.pi, arc_points)
         lines.append(
             np.column_stack(
-                [spot_x + CENTER_CIRCLE_RADIUS_M * np.cos(arc), half_width + CENTER_CIRCLE_RADIUS_M * np.sin(arc)]
+                [
+                    half_length + markings.center_circle_radius_m * np.cos(angles),
+                    half_width + markings.center_circle_radius_m * np.sin(angles),
+                ]
             )
         )
+    if markings.has_penalty_arc:
+        # The part of the arc around each penalty spot that lies outside the penalty box.
+        theta = np.arccos(
+            (markings.penalty_area_depth_m - markings.penalty_spot_distance_m) / markings.penalty_arc_radius_m
+        )
+        for spot_x, facing in (
+            (markings.penalty_spot_distance_m, 0.0),
+            (length_m - markings.penalty_spot_distance_m, np.pi),
+        ):
+            arc = np.linspace(facing - theta, facing + theta, arc_points)
+            lines.append(
+                np.column_stack(
+                    [
+                        spot_x + markings.penalty_arc_radius_m * np.cos(arc),
+                        half_width + markings.penalty_arc_radius_m * np.sin(arc),
+                    ]
+                )
+            )
     # Corner arcs (1 m radius).
     for corner_x, corner_y, start in (
         (0.0, 0.0, 0.0),
@@ -572,6 +622,8 @@ def overlay_homographies(
     length_m: float,
     width_m: float,
     frame_count: int,
+    *,
+    format_name: str | None = None,
     samples: int = 240,
 ) -> list[dict]:
     """Pitch->pixel homographies sampled along the chain, for the browser to project the overlay itself.
@@ -592,7 +644,7 @@ def overlay_homographies(
     limit = min(frame_count, len(q))
     frames = np.unique(np.linspace(0, limit - 1, min(samples, limit)).round().astype(int))
     # The markings are the same for every sample; only the projection changes.
-    points = np.concatenate(pitch_marking_polylines(length_m, width_m), axis=0)
+    points = np.concatenate(pitch_marking_polylines(length_m, width_m, format_name=format_name), axis=0)
     out: list[dict] = []
     for frame in frames:
         q_frame, focal_frame = calibration.corrected_frame(q[frame], float(focal[frame]), int(frame))
@@ -628,19 +680,22 @@ def pitch_overlay(
     focal: float,
     length_m: float,
     width_m: float,
+    *,
+    format_name: str | None = None,
     table: dict[str, tuple[float, float]] | None = None,
 ) -> np.ndarray:
     """Draw the pitch markings back into the frame - the check that the landmarks were labeled the right way round.
 
     Without this the user has no way to tell a good registration from a mirrored one: the numbers alone look
-    plausible either way. The whole set of standard markings is drawn - touchlines, halfway line, both boxes, the
-    center circle, the penalty arcs and spots and the corner arcs - so a fit can be checked against the markings
-    that are actually visible rather than only the outline. Pass ``table`` to mark each named landmark as well, which
-    shows the corners that were never clicked where the fit puts them.
+    plausible either way. The whole set of standard markings is drawn - touchlines, halfway line, the format's
+    boxes, the center circle, the penalty arcs and spots and the corner arcs - so a fit can be checked against the
+    markings that are actually visible rather than only the outline. Pass ``table`` to mark each named landmark as
+    well, which shows the corners that were never clicked where the fit puts them.
     """
+    markings = markings_for(format_name)
     drawn = image.copy()
     width = drawn.shape[1]
-    for points in pitch_marking_polylines(length_m, width_m):
+    for points in pitch_marking_polylines(length_m, width_m, format_name=format_name):
         uv, in_front = pitch_to_pixels(calibration, points, q, focal)
         pixels = uv * width
         for index in range(len(points) - 1):
@@ -652,7 +707,12 @@ def pitch_overlay(
             cv2.line(drawn, tuple(np.round(start).astype(int)), tuple(np.round(end).astype(int)), (0, 255, 255), 3)
 
     # The penalty spots are points, not lines, so they are drawn as small filled dots.
-    spots = np.array([[PENALTY_SPOT_DISTANCE_M, width_m / 2], [length_m - PENALTY_SPOT_DISTANCE_M, width_m / 2]])
+    spots = np.array(
+        [
+            [markings.penalty_spot_distance_m, width_m / 2],
+            [length_m - markings.penalty_spot_distance_m, width_m / 2],
+        ]
+    )
     uv, in_front = pitch_to_pixels(calibration, spots, q, focal)
     for point, front in zip(uv * width, in_front):
         if front and np.isfinite(point).all():

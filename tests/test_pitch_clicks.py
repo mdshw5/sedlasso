@@ -20,6 +20,7 @@ from soccer_analytics.dashboard.pitch_clicks import (
     frame_points,
     frame_to_canvas,
     inside_crop,
+    landmark_help,
     landmark_table,
     landmarks_from_points,
     marker_feature,
@@ -39,6 +40,7 @@ from soccer_analytics.dashboard.pitch_clicks import (
     zoom_box,
 )
 from soccer_analytics.geometry.pitch_calibration import PitchCalibration, pitch_to_pixels
+from soccer_analytics.geometry.pitch_markings import markings_for
 
 FRAME_W, FRAME_H = 3840, 2160
 
@@ -319,14 +321,15 @@ def test_goal_posts_sit_on_their_own_goal_line_either_side_of_the_goal_center() 
     """The posts are the stand-ins for corners that are out of frame, so they must be where the laws put them.
 
     They are only useful because a post is a hard edge that can be clicked to a pixel and its real position is fixed
-    by the laws of the game - if a post drifted off the goal line, or the pair were not 7.32 m apart, every fit built
-    on them would be skewed.
+    by the laws of the game - if a post drifted off the goal line, or the pair were not the format's goal width
+    apart, every fit built on them would be skewed. A 9v9 goal is 16 ft wide, not the 11-a-side 8 yards.
     """
-    table = landmark_table(60.0, 40.0)
-    assert table["goal post left-near"] == (0.0, 20.0 - 3.66)
-    assert table["goal post left-far"] == (0.0, 20.0 + 3.66)
-    assert table["goal post right-near"] == (60.0, 20.0 - 3.66)
-    assert table["goal post right-far"] == (60.0, 20.0 + 3.66)
+    table = landmark_table(60.0, 40.0, format_name="9v9")
+    half_goal = 16 * 0.3048 / 2
+    assert table["goal post left-near"] == pytest.approx((0.0, 20.0 - half_goal))
+    assert table["goal post left-far"] == pytest.approx((0.0, 20.0 + half_goal))
+    assert table["goal post right-near"] == pytest.approx((60.0, 20.0 - half_goal))
+    assert table["goal post right-far"] == pytest.approx((60.0, 20.0 + half_goal))
     for near, far, corner_a, corner_b in (
         ("goal post left-near", "goal post left-far", "corner near-left", "corner far-left"),
         ("goal post right-near", "goal post right-far", "corner near-right", "corner far-right"),
@@ -334,7 +337,7 @@ def test_goal_posts_sit_on_their_own_goal_line_either_side_of_the_goal_center() 
         # On the goal line itself, not in front of it, and straddling the goal center.
         assert table[near][0] == table[far][0] == table[corner_a][0] == table[corner_b][0]
         assert table[near][1] < table[far][1]
-        assert table[far][1] - table[near][1] == pytest.approx(7.32), "the posts are 7.32 m apart"
+        assert table[far][1] - table[near][1] == pytest.approx(16 * 0.3048), "the posts are 16 ft apart"
         assert (table[near][1] + table[far][1]) / 2 == pytest.approx((table[corner_a][1] + table[corner_b][1]) / 2)
 
     # And the whole set must not be collinear, since a straight line cannot fix a camera.
@@ -346,7 +349,7 @@ def test_goal_posts_sit_on_their_own_goal_line_either_side_of_the_goal_center() 
 def test_the_boxes_are_not_clickable() -> None:
     """The boxes are the markings the clicks cannot place accurately, so they must not be offered.
 
-    The six-yard box is small and lost against the netting and the goal frame; an eighteen-yard corner is a bare
+    The goal area is small and lost against the netting and the goal frame; a penalty-area corner is a bare
     junction of two lines with nothing to focus on. A click a meter out is a meter of error in the fit, so the
     posts carry that end of the pitch instead and the penalty spots pin the box's depth.
     """
@@ -360,10 +363,10 @@ def test_spot_and_circle_landmarks_sit_on_the_standard_markings() -> None:
 
     The penalty spots and center-circle cardinals are the markings that are usually visible when the corners are
     not, so a click on any of them is a measurement of the pitch - but only if the pitch position is right. These
-    are the standard dimensions, the same for every format.
+    are the 11-a-side dimensions; the 9v9 template is checked separately below.
     """
     length_m, width_m = 100.0, 64.0
-    table = landmark_table(length_m, width_m)
+    table = landmark_table(length_m, width_m, format_name="11v11")
     half_width = width_m / 2
 
     # Penalty spots: 11 m out from the goal line, on the goal center line.
@@ -375,6 +378,75 @@ def test_spot_and_circle_landmarks_sit_on_the_standard_markings() -> None:
     assert table["center circle far"] == (length_m / 2, half_width + 9.15)
     assert table["center circle left"] == (length_m / 2 - 9.15, half_width)
     assert table["center circle right"] == (length_m / 2 + 9.15, half_width)
+
+
+def test_nine_a_side_markings_match_the_fa_guide_and_clear_the_center_circle() -> None:
+    """The 9v9 template must use the FA's 7-yard circle and 13-yard penalty area, not the 11-a-side values.
+
+    Regression test for the reported failure: with the 11-a-side markings, a 60 x 40 m 9v9 pitch put the penalty
+    area's front edge 16.5 m from the goal line and the centre circle's near edge 20.85 m out - only 4.35 m apart,
+    so the box appeared to swallow the circle. The FA 9v9 box is 13 yards deep and the circle is 7 yards in radius,
+    leaving more than 11 m between them.
+    """
+    markings = markings_for("9v9")
+    yard = 0.9144
+    assert markings.penalty_area_width_m == pytest.approx(32 * yard)
+    assert markings.penalty_area_depth_m == pytest.approx(13 * yard)
+    assert markings.goal_area_width_m == pytest.approx(14 * yard)
+    assert markings.goal_area_depth_m == pytest.approx(4 * yard)
+    assert markings.penalty_spot_distance_m == pytest.approx(9 * yard)
+    assert markings.center_circle_radius_m == pytest.approx(7 * yard)
+    assert markings.goal_width_m == pytest.approx(16 * 0.3048)
+
+    length_m, width_m = 60.0, 40.0
+    table = landmark_table(length_m, width_m, format_name="9v9")
+    half_width = width_m / 2
+    assert table["penalty spot left"] == pytest.approx((9 * yard, half_width))
+    assert table["center circle left"] == pytest.approx((length_m / 2 - 7 * yard, half_width))
+    assert table["center circle near"] == pytest.approx((length_m / 2, half_width - 7 * yard))
+
+    # The failure this guards: the penalty box front edge and the centre circle near edge must not meet.
+    box_front = markings.penalty_area_depth_m
+    circle_back = length_m / 2 - markings.center_circle_radius_m
+    assert circle_back - box_front > 10.0, "the 9v9 penalty area is too close to the centre circle"
+
+    # The drawn markings must use the same dimensions, not just the landmark table.
+    lines = pitch_marking_polylines(length_m, width_m, format_name="9v9")
+    penalty_boxes = [line for line in lines if len(line) == 4 and np.isclose(np.ptp(line[:, 1]), 32 * yard)]
+    assert len(penalty_boxes) == 2, "one penalty area at each end"
+    assert all(np.isclose(np.ptp(line[:, 0]), 13 * yard) for line in penalty_boxes)
+    circles = [
+        line
+        for line in lines
+        if np.allclose(np.linalg.norm(line - np.array([length_m / 2, half_width]), axis=1), 7 * yard)
+    ]
+    assert len(circles) == 1, "exactly one 7-yard centre circle"
+
+
+def test_mini_soccer_markings_omit_the_goal_area_and_center_circle() -> None:
+    """A format that does not have a marking must not offer a click for it or draw a degenerate one."""
+    for format_name, length_m, width_m in (("5v5", 40.0, 25.0), ("7v7", 50.0, 35.0)):
+        markings = markings_for(format_name)
+        assert not markings.has_goal_area
+        assert not markings.has_center_circle
+        assert not markings.has_penalty_arc
+
+        table = landmark_table(length_m, width_m, format_name=format_name)
+        assert "center spot" not in table
+        assert not [name for name in table if name.startswith("center circle")]
+
+        # Outline + halfway + one penalty area per end + four corner arcs. No goal area, circle or penalty arc.
+        lines = pitch_marking_polylines(length_m, width_m, format_name=format_name)
+        assert len(lines) == 8
+
+
+def test_landmark_help_quotes_the_selected_formats_distances() -> None:
+    """The click instructions must not tell a 9v9 user to find an 11 m spot or a 9.15 m circle."""
+    help_9v9 = landmark_help("9v9")
+    assert "8.23 m" in help_9v9["penalty spot left"]
+    assert "6.40 m center circle" in help_9v9["center circle near"]
+    assert "4.88 m" in help_9v9["goal post left-near"]
+    assert "9.15 m" not in help_9v9["center circle near"]
 
 
 def test_overlay_homographies_reproduce_the_projection() -> None:

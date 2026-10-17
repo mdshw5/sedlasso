@@ -307,7 +307,11 @@ def main() -> int:
 
         calibration = PitchCalibration.from_json(json.loads(args.calibration.read_text()))
         record = json.loads((args.calibration.parent / "match.json").read_text())
-        table = landmark_table(float(record["pitch_length_m"]), float(record["pitch_width_m"]))
+        table = landmark_table(
+            float(record["pitch_length_m"]),
+            float(record["pitch_width_m"]),
+            format_name=record.get("format"),
+        )
         clicks_path = args.clicks or (args.calibration.parent / "clicks.json")
         clicks = json.loads(clicks_path.read_text())
         clicks = clicks.get("clicks", clicks) if isinstance(clicks, dict) else clicks

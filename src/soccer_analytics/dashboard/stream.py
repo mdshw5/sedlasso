@@ -421,6 +421,7 @@ class AnnotatedMatch:
         frame_count: int,
         native: tuple[int, int, float] = (0, 0, 0.0),
         pitch: tuple[float, float],
+        format_name: str | None = None,
         calibration,
         q: np.ndarray,
         focal: np.ndarray,
@@ -443,6 +444,7 @@ class AnnotatedMatch:
         self.native_height = int(native[1]) or 0
         self.native_fps = float(native[2]) or self.fps
         self.pitch = (float(pitch[0]), float(pitch[1]))
+        self.format_name = format_name
         self.calibration = calibration
         self.q = q
         self.focal = focal
@@ -454,7 +456,7 @@ class AnnotatedMatch:
         self._player_ids = [int(player["track_id"]) for player in players]
         # Each player's team index, so a team roster can name the player behind a scanned number.
         self._teams = {int(player["track_id"]): int(player.get("team", -1)) for player in players}
-        self.pitch_lines = pitch_marking_polylines(*self.pitch)
+        self.pitch_lines = pitch_marking_polylines(*self.pitch, format_name=self.format_name)
 
         # Boxes and labels, indexed by analysis frame: exactly what one rendered frame has to walk. The boxes
         # arrive separately from the payload (the ``boxes.npz`` beside it); each player's array is aligned with
@@ -614,6 +616,7 @@ class AnnotatedMatch:
                 float(segment.meta.get("source_fps") or 0.0),
             ),
             pitch=(replay["pitch"][0], replay["pitch"][1]),
+            format_name=record.format,
             calibration=calibration,
             q=q,
             focal=focal,

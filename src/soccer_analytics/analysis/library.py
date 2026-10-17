@@ -407,14 +407,25 @@ class MatchLibrary:
         path.unlink()
         return True
 
-    def save_clicks(self, match_id: str, clicks: list[dict], pitch: tuple[float, float] | None = None) -> Path:
+    def save_clicks(
+        self,
+        match_id: str,
+        clicks: list[dict],
+        pitch: tuple[float, float] | None = None,
+        source: str | None = None,
+    ) -> Path:
         """Keep the landmark clicks next to the calibration they produced.
 
         Without this a bad fit cannot be looked at afterwards: the residual table in the page can only name a click
-        by its landmark while the browser session that made it is still alive.
+        by its landmark while the browser session that made it is still alive. ``source`` records the recording the
+        clicks were made on: frames are indices into that recording's timeline, and restoring them against a
+        different video puts the same frame number on different pictures.
         """
         path = self.path(match_id) / "clicks.json"
-        _atomic_write(path, {"clicks": clicks, "pitch": list(pitch) if pitch else None})
+        _atomic_write(
+            path,
+            {"clicks": clicks, "pitch": list(pitch) if pitch else None, "source": source},
+        )
         return path
 
     def load_clicks(self, match_id: str) -> list[dict]:
@@ -426,6 +437,19 @@ class MatchLibrary:
             if click.get("label"):
                 click["label"] = upgrade_landmark_label(click["label"])
         return clicks
+
+    def load_clicks_source(self, match_id: str) -> str | None:
+        """The recording the saved clicks were made on, when the archive recorded it.
+
+        Legacy archives have no source and return ``None``. The dashboard then falls back to the old behavior
+        (restore against whichever video is open), because refusing an unlabelled set would silently discard the
+        only copy of a pre-upgrade calibration.
+        """
+        path = self.path(match_id) / "clicks.json"
+        if not path.exists():
+            return None
+        source = json.loads(path.read_text()).get("source")
+        return str(source) if source else None
 
     def save_report(self, match_id: str, payload: dict) -> Path:
         path = self.path(match_id) / "report.json"

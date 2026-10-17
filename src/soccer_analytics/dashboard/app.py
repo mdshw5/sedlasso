@@ -75,14 +75,15 @@ from soccer_analytics.analysis.projection import project_ball_track, project_seg
 from soccer_analytics.analysis.rosters import RosterLibrary, team_rosters_for
 from soccer_analytics.analysis.stage_a import SegmentConfig, load_segment, read_status, resolve_window, segment_dir_for
 from soccer_analytics.geometry.gimbal_motion import segment_has_log, segment_pose_source
+from soccer_analytics.geometry.pitch_markings import markings_for
 from soccer_analytics.dashboard.pitch_clicks import (
-    LANDMARK_HELP,
     actual_center,
     canvas_scale,
     clamp01,
     frame_change,
     frame_points,
     inside_crop,
+    landmark_help,
     landmark_table,
     landmarks_from_points,
     marker_feature,
@@ -1141,6 +1142,7 @@ def fit_from_clicks(
     land_table: dict[str, tuple[float, float]],
     length_m: float,
     width_m: float,
+    source: str | None = None,
 ) -> PitchCalibration | None:
     """Fit the calibration from the labeled clicks and save it; None when the fit failed.
 
@@ -1162,12 +1164,24 @@ def fit_from_clicks(
         # saying *why* it failed is the difference between a five-minute fix and a hunt.
         st.session_state["calib_fit_error"] = f"{type(exc).__name__}: {exc}"
         return None
+    # A fit that cannot be reconciled must never replace a good saved calibration. Restoring a click set against
+    # the wrong recording (or a mislabeled set) produces a wildly wrong but numerically "successful" solve; saving
+    # it would destroy the calibration that was working. Keep the previous calibration on disk and report the
+    # rejection instead.
+    diagnosis = diagnose_fit(calibration)
+    if diagnosis.reason or diagnosis.too_few_agreeing:
+        st.session_state["calib_fit_error"] = (
+            "the refit is not usable - "
+            + (diagnosis.reason or "the clicks do not agree with each other")
+            + ". The saved calibration was left unchanged."
+        )
+        return None
     st.session_state.pop("calib_fit_error", None)
     clicks = [{"frame": lm.frame, "u": lm.u, "v": lm.v, "label": lm.label} for lm in landmarks]
     st.session_state["calibration"] = calibration.to_json()
     st.session_state["calib_landmarks"] = clicks
     library.save_calibration(match_id, calibration)
-    library.save_clicks(match_id, clicks, (length_m, width_m))
+    library.save_clicks(match_id, clicks, (length_m, width_m), source=source)
     return calibration
 
 
@@ -3089,6 +3103,22 @@ if segment is not None:
             "Match format", list(MATCH_FORMATS), index=list(MATCH_FORMATS).index(stored_format)
         )
     length_m, width_m = MATCH_FORMATS[format_name]
+    markings = markings_for(format_name)
+    markings_detail = (
+        f"{markings.penalty_area_width_m:.2f} x {markings.penalty_area_depth_m:.2f} m penalty area"
+        + (
+            f", {markings.goal_area_width_m:.2f} x {markings.goal_area_depth_m:.2f} m goal area"
+            if markings.has_goal_area
+            else ""
+        )
+        + (
+            f", {markings.center_circle_radius_m:.2f} m center circle"
+            if markings.has_center_circle
+            else ""
+        )
+        + f", {markings.goal_width_m:.2f} m goal"
+    )
+    st.caption(f"**{format_name} markings:** {markings_detail}. These are the markings the fit and overlay expect.")
     if (record.format, record.pitch_length_m, record.pitch_width_m) != (format_name, length_m, width_m):
         had_calibration = library.load_calibration(match_id) is not None
         record.format, record.pitch_length_m, record.pitch_width_m = format_name, length_m, width_m
@@ -3102,7 +3132,8 @@ if segment is not None:
     # q/focal come from the same cache as the segment: rebuilding the chain costs ~1 s on the whole-game segment
     # even with the fast path, and this line is on the gesture loop's hot path.
     frame_count = len(segment.time)
-    land_table = landmark_table(length_m, width_m)
+    land_table = landmark_table(length_m, width_m, format_name=format_name)
+    help_table = landmark_help(format_name)
     names = list(land_table)
 
     # Clicks belong to one match, one video and one pitch size. Switching any of them must not quietly blend the
@@ -3114,7 +3145,24 @@ if segment is not None:
     clicks_key = f"{match_id}|{chosen}|{format_name}"
     if st.session_state.get("calib_clicks_key") != clicks_key:
         saved_clicks = library.load_clicks(match_id)
-        restored = restored_points(saved_clicks, frame_count) if saved_clicks else None
+        saved_source = library.load_clicks_source(match_id)
+        # Frames are indices into the recording the clicks were made on. Restoring a set made on one clip while a
+        # different video is open puts the same frame number on different pictures; the fit then looks like a bad
+        # calibration and (worse) can overwrite the good one on disk. New sets name their source. Legacy sets have
+        # no source, so they are only restored when the open video is one this match actually recorded - otherwise
+        # another match's clicks would be applied to this footage and then re-saved into this archive.
+        if saved_source:
+            same_source = Path(saved_source).resolve() == Path(chosen).resolve()
+        else:
+            same_source = any(Path(source).resolve() == Path(chosen).resolve() for source in record.sources)
+        restored = restored_points(saved_clicks, frame_count) if saved_clicks and same_source else None
+        if restored:
+            # A format that has no centre circle (5v5/7v7) also has no landmark by that name. A set saved before
+            # the format-aware tables could still carry one; keep the click but let the user re-label it rather
+            # than crashing the fit on a name that is no longer in the table.
+            for point in restored:
+                if point.get("label") and point["label"] not in land_table:
+                    point.pop("label")
         st.session_state["calib_clicks_key"] = clicks_key
         st.session_state["calib_points"] = restored or []
         st.session_state["calib_landmarks"] = saved_clicks if restored else []
@@ -3125,6 +3173,14 @@ if segment is not None:
         st.session_state["calib_zoom"] = DEFAULT_ZOOM
         st.session_state["calib_reference"] = int(restored[0]["frame"]) if restored else 0
         st.session_state.pop("calibration", None)
+        if saved_clicks and saved_source and not same_source:
+            st.session_state["calib_restore_note"] = (
+                f"The saved clicks were made on `{Path(saved_source).name}`. Select that video in Step 1 to bring "
+                "them back; they are not restored on a different recording."
+            )
+    restore_note = st.session_state.pop("calib_restore_note", "")
+    if restore_note:
+        st.info(restore_note)
 
     # The clicking workspace stays on the page: it is the thing you are working in while a calibration is being
     # made, and hiding it behind a toggle would put a click between every aim and every landmark. Only the saved
@@ -3132,19 +3188,19 @@ if segment is not None:
     # click.
     with st.expander("What are pitch landmarks, and how do I click them?", expanded=False):
         st.markdown(
-            """
+            f"""
 The camera moves, so the app has to work out *where the camera was* before it can say where a player is. It does
 that from **landmarks**: fixed markings on the pitch whose real position you already know, because the laws of the
-game put them there. Halfway line, center spot, corner flags, the goalposts, the penalty spots, the center
-circle - those are the only things in the frame with a known real-world position, so the calibration is only ever
-as good as these clicks.
+game put them there. The corners, the posts, the halfway line, the penalty spots, and the center circle where the
+format has one - those are the only things in the frame with a known real-world position, so the calibration is
+only ever as good as these clicks. This match uses the **{format_name}** markings listed below.
 
 **What to click**
 
 | Landmark | Click exactly on |
 | --- | --- |
 """
-        + "\n".join(f"| `{name}` | {LANDMARK_HELP[name]} |" for name in land_table)
+        + "\n".join(f"| `{name}` | {help_table[name]} |" for name in land_table)
         + """
 
 **How to do it**
@@ -3163,14 +3219,14 @@ as good as these clicks.
 4. **If a corner is not in shot, use the goalposts instead.** The near corner flags are often out of frame or lost
    against the grass, but the posts are easy to pick out, and the base of a post - where it meets the goal line -
    says as much about that end of the pitch as the flag does. Click **goal post left-near** / **goal post
-   left-far** (or the `right` pair) in place of a corner you cannot see. The posts are 7.32 m apart, so the two of
-   them together also fix the goal line's direction.
-5. **The penalty spots and center circle are usually visible too.** The penalty spots and the four points where
-   the center circle crosses the halfway and center lines are standard markings at a range of distances from the
-   camera - exactly the spread the fit is short of when the near corners are out of shot. Click the ones you can
-   see clearly. The boxes are deliberately not in the list: the six-yard box is small and lost against the
-   netting, and an eighteen-yard corner is a bare junction of two lines with nothing to focus on - the posts carry
-   that end of the pitch instead, and the penalty spots pin the box's depth.
+   left-far** (or the `right` pair) in place of a corner you cannot see. The posts are {markings.goal_width_m:.2f} m
+   apart for this format, so the two of them together also fix the goal line's direction.
+5. **The penalty spots are usually visible too, and so is the center circle where the format has one.** Those
+   markings sit at a range of distances from the camera - exactly the spread the fit is short of when the near
+   corners are out of shot. Click the ones you can see clearly. The boxes are deliberately not in the list: the
+   goal area (where the format has one) is small and lost against the netting, and a penalty-area corner is a bare
+   junction of two lines with nothing to focus on - the posts carry that end of the pitch instead, and the penalty
+   spots pin the box's depth.
 6. **What you cannot substitute is spread.** Four clicks that are all a long way off, or all along one line, leave
    the fit with tens of meters of doubt - measured on a simulated match, four distant landmarks were out by more
    than 50 m. Aim for landmarks at a *range* of distances from the camera: the halfway line where it meets the near
@@ -3284,19 +3340,30 @@ are sure of.
         if overlay_on and calibration_for_view is not None:
             view_q, view_focal = calibration_for_view.corrected_frame(q[reference], float(focal[reference]), reference)
             overview = pitch_overlay(
-                overview, calibration_for_view, view_q, view_focal, length_m, width_m, table=land_table
+                overview,
+                calibration_for_view,
+                view_q,
+                view_focal,
+                length_m,
+                width_m,
+                format_name=format_name,
+                table=land_table,
             )
         # The browser-side overlay: sampled homographies along the corrected chain plus the markings in pitch
         # meters, so the component can draw the pitch on whatever frame the timeline is showing - scrubbed or
         # playing - without a round trip per frame. Recomputed from the current calibration on every run, so a
         # refit redraws the overlay immediately.
         browser_overlay = (
-            overlay_homographies(calibration_for_view, q, focal, length_m, width_m, frame_count)
+            overlay_homographies(
+                calibration_for_view, q, focal, length_m, width_m, frame_count, format_name=format_name
+            )
             if overlay_on and calibration_for_view is not None
             else []
         )
         browser_polylines = (
-            [line.tolist() for line in pitch_marking_polylines(length_m, width_m)] if browser_overlay else []
+            [line.tolist() for line in pitch_marking_polylines(length_m, width_m, format_name=format_name)]
+            if browser_overlay
+            else []
         )
         proxy_url = (
             _timeline_media_url(timeline.proxy_path(segment_dir), coordinates=f"timeline::{segment_dir}")
@@ -3530,7 +3597,7 @@ are sure of.
                 labeled.append((point, label))
                 # Always describe the landmark that is actually selected: it is the moment the user picks a
                 # non-default landmark that they most need to check what it means.
-                st.caption(f"&nbsp;&nbsp;&nbsp;&nbsp;{LANDMARK_HELP[label]}")
+                st.caption(f"&nbsp;&nbsp;&nbsp;&nbsp;{help_table.get(label, '')}")
 
             # What the *fit* uses is each click's dropdown value, and two dropdowns can still show the same
             # landmark without the stored tags agreeing: an untagged click displays the list's first entry, and a
@@ -3591,7 +3658,9 @@ are sure of.
         signature = [(point["frame"], point["pid"], label) for point, label in labeled]
         if st.session_state.get("calib_fit_signature") != signature:
             st.session_state["calib_fit_signature"] = signature
-            calibration = fit_from_clicks(library, match_id, segment, q, focal, labeled, land_table, length_m, width_m)
+            calibration = fit_from_clicks(
+                library, match_id, segment, q, focal, labeled, land_table, length_m, width_m, source=chosen
+            )
             if calibration is None:
                 st.session_state.pop("calib_fit_signature", None)  # let the next change retry
                 st.error(calibration_failure())
@@ -3608,7 +3677,9 @@ are sure of.
                  "automatically whenever the clicks change; this is here for a refit against a changed camera "
                  "motion, or when you just want to run it again.",
         ):
-            calibration = fit_from_clicks(library, match_id, segment, q, focal, labeled, land_table, length_m, width_m)
+            calibration = fit_from_clicks(
+                library, match_id, segment, q, focal, labeled, land_table, length_m, width_m, source=chosen
+            )
             if calibration is None:
                 st.error(calibration_failure())
             else:
