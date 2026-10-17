@@ -724,7 +724,6 @@ def _start_video_export(
     segment_dir: Path,
     source: str,
     output: Path,
-    *,
     width: int,
     fps: float,
     codec: str,

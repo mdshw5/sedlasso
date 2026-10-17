@@ -6,6 +6,7 @@ this catches the class of error that only appears when the script actually runs.
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,22 @@ import pytest
 streamlit_testing = pytest.importorskip("streamlit.testing.v1")
 
 APP = Path(__file__).resolve().parents[1] / "src" / "soccer_analytics" / "dashboard" / "app.py"
+
+
+def test_the_export_button_callback_takes_every_argument_positionally() -> None:
+    """Streamlit's ``on_click=...`` passes ``args`` positionally.
+
+    A keyword-only signature here looks tidier but fails at click time with "takes 5 positional arguments but 12
+    were given" - the export button must be callable with exactly the tuple it passes.
+    """
+    tree = ast.parse(APP.read_text())
+    function = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_start_video_export"
+    )
+    assert not function.args.kwonlyargs, "the export callback must accept the button's arguments positionally"
+    assert len(function.args.args) == 12
 
 
 def _no_footage(app) -> bool:
