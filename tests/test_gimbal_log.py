@@ -236,6 +236,30 @@ def test_find_logs_matches_a_clip_to_its_log_by_time_of_day(tmp_path) -> None:
     assert [Path(p).name for p, _ in pairs] == ["2026-10-03 16:28:37.json", "2026-10-03 16:58:38.json"]
 
 
+def test_find_logs_accepts_logs_beside_the_clips(tmp_path) -> None:
+    """Keeping the logs in the footage folder is the simplest layout, so it is the first place searched."""
+    log = tmp_path / "2026-10-03 16:28:37.json"
+    log.write_text(HEADER)
+    pairs = find_logs_for_clips([str(tmp_path / "16:28:37.784.MP4")])
+    assert pairs is not None
+    assert Path(pairs[0][0]) == log
+    assert pairs[0][1] == 0.0
+
+
+def test_find_logs_accepts_a_renamed_or_differently_cased_log_directory(tmp_path) -> None:
+    """The camera's folder name is a convention, not a requirement: a renamed folder still holds the logs."""
+    for index, folder in enumerate(("chameleon logs", "camera telemetry")):
+        base = tmp_path / f"case{index}"
+        base.mkdir()
+        log_dir = base / folder
+        log_dir.mkdir()
+        (log_dir / "2026-10-03 16:28:37.json").write_text(HEADER)
+        pairs = find_logs_for_clips([str(base / "16:28:37.784.MP4")])
+        assert pairs is not None, folder
+        assert Path(pairs[0][0]) == log_dir / "2026-10-03 16:28:37.json"
+        assert pairs[0][1] == 0.0
+
+
 def test_find_logs_returns_none_without_a_log_directory(tmp_path) -> None:
     assert find_logs_for_clips([str(tmp_path / "16:28:37.784.MP4")]) is None
 

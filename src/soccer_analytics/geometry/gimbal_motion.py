@@ -148,6 +148,7 @@ def fit_pan_model(
     pitch: np.ndarray | None = None,
     *,
     window: int = SCALE_WINDOW,
+    min_samples: int = MIN_AXIS_SAMPLES,
 ) -> PanModel | None:
     """Fit the pan model: the physical axis from the logged tilt, and the yaw scale from the chain's steps.
 
@@ -200,7 +201,7 @@ dragged the median from ~1.0 down to 0.70 - every projection then under-rotated 
     selected: tuple[np.ndarray, np.ndarray] | None = None
     for candidate in (window, max(window // 2, AXIS_WINDOW), AXIS_WINDOW):
         signed_arr, dyaw_arr = aligned_samples(candidate)
-        if len(signed_arr) >= MIN_AXIS_SAMPLES:
+        if len(signed_arr) >= min_samples:
             selected = (signed_arr, dyaw_arr)
             break
     if selected is None:
@@ -313,43 +314,61 @@ def load_logs_for_clips(
     return [(load_gimbal_log(path), float(start)) for path, start in zip(log_paths, clip_starts)]
 
 
-# The camera writes its logs in a directory beside the clips, named for the camera model. The clip's own name is a
-# timestamp ("16:28:37.784.MP4") and the log's is the same timestamp ("2026-10-03 16:28:37.json"), so a clip is
-# matched to its log by the time-of-day part of the name.
+# The camera writes its logs in a directory beside the clips, usually named for the camera model. The clip's own
+# name is a timestamp ("16:28:37.784.MP4") and the log's is the same timestamp ("2026-10-03 16:28:37.json"), so a
+# clip is matched to its log by the time-of-day part of the name. These names are only preferred spellings: the
+# folder may be renamed (or its case changed), so every sibling folder is searched after them.
 LOG_DIR_NAMES = ("Chameleon Logs", "Falcon Logs", "Logs")
 _CLIP_TIME = re.compile(r"(\d{2})[:-](\d{2})[:-](\d{2})")
+
+
+def _log_directories(directory: Path) -> list[Path]:
+    """Folders to search for logs: the clip's own folder, then its usual siblings, then every other sibling."""
+    if not directory.is_dir():
+        return []
+    children = [path for path in directory.iterdir() if path.is_dir()]
+    preferred = [
+        path
+        for name in LOG_DIR_NAMES
+        for path in children
+        if path.name.casefold() == name.casefold()
+    ]
+    others = [path for path in sorted(children, key=lambda path: path.name.casefold()) if path not in preferred]
+    return [directory] + preferred + others
 
 
 def find_logs_for_clips(clip_paths: list[str | Path]) -> list[tuple[str, float]] | None:
     """Locate the gimbal logs for a game's clips, returning ``(log_path, clip_start_s)`` pairs in clip order.
 
     The clips are the files the game was combined from, each with the second it begins at in the combined video.
-    The logs sit in a sibling directory (``Chameleon Logs`` and friends) and are named by the same wall-clock time
-    as the clip, so each clip is matched to the log whose name carries its time-of-day. Returns ``None`` when no
-    log directory is found, so a caller can fall back to the estimated chain rather than fail.
+    The logs are named by the same wall-clock time as the clip, so each clip is matched to the log whose name
+    carries its time-of-day. They may sit beside the clips, in a directory named for the camera (``Chameleon
+    Logs`` and friends), or in any other sibling folder: the clip's own folder is tried first, then the known
+    names, then every other sibling folder. Returns ``None`` when no folder has a matching log for every clip, so
+    a caller can fall back to the estimated chain rather than fail.
     """
     if not clip_paths:
         return None
-    first = Path(clip_paths[0])
-    directory = first.parent
-    log_dir = next((directory / name for name in LOG_DIR_NAMES if (directory / name).is_dir()), None)
-    if log_dir is None:
-        return None
-    logs = sorted(log_dir.glob("*.json"))
-    if not logs:
-        return None
-    pairs: list[tuple[str, float]] = []
+    wanted: list[str] = []
     for clip in clip_paths:
         match = _CLIP_TIME.search(Path(clip).name)
         if match is None:
             return None
         hh, mm, ss = match.groups()
-        wanted = f"{hh}:{mm}:{ss}"
-        found = next((log for log in logs if wanted in log.name), None)
-        if found is None:
-            return None
-        pairs.append((str(found), 0.0))
-    return pairs
+        wanted.append(f"{hh}:{mm}:{ss}")
+    for log_dir in _log_directories(Path(clip_paths[0]).parent):
+        logs = sorted(log_dir.glob("*.json"))
+        if not logs:
+            continue
+        pairs: list[tuple[str, float]] = []
+        for key in wanted:
+            found = next((log for log in logs if key in log.name), None)
+            if found is None:
+                break
+            pairs.append((str(found), 0.0))
+        else:
+            return pairs
+    return None
 
 
 def build_log_poses(

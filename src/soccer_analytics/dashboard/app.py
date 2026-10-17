@@ -3120,6 +3120,37 @@ else:
             f"Game clock: kick-off {_clock(game_marks[0])}, half-time {_clock(game_marks[1])}, full-time "
             f"{_clock(game_marks[2])}. Events and the report are labeled by half."
         )
+    stored_width_now = int(existing_meta.get("detect_width", 1920)) if existing_meta is not None else 0
+    detail_options = [
+        f"Full resolution ({int(probe.width)} px wide - slower, best far-side recall)",
+        f"Fast ({min(1920, int(probe.width))} px wide - about 3x faster)",
+    ]
+    detail = st.selectbox(
+        "Detection detail",
+        detail_options,
+        index=1 if existing_meta is not None and stored_width_now < int(probe.width) else 0,
+        key=f"detect_detail::{chosen}",
+        help=(
+            "Full resolution finds more players on the far side of the pitch. Fast detection is roughly three "
+            "times faster and keeps the near-side players; it is the right choice when a first pass matters more "
+            "than every distant box. The width is stored with the analysis, so a different choice restarts it."
+        ),
+    )
+    analysis_width = int(probe.width) if detail.startswith("Full") else min(1920, int(probe.width))
+    if analysis_width < int(probe.width):
+        st.caption(
+            f"Fast detection samples the video at {analysis_width} px wide instead of {int(probe.width)} px."
+        )
+    use_log_motion = st.checkbox(
+        "Reuse gimbal motion for tracking",
+        value=True,
+        key=f"log_motion::{chosen}",
+        help=(
+            "Stage A already measures a camera-motion step for the pose chain. When a gimbal log is present, "
+            "BoT-SORT reuses that step instead of estimating global motion again at full resolution, which is "
+            "faster. Turn this off if track identities fragment during fast pans."
+        ),
+    )
 
     def _same_window(meta: dict) -> bool:
         """Whether the results already in the output directory cover exactly the requested window."""
@@ -3130,11 +3161,11 @@ else:
 
     window_conflict = existing_meta is not None and not _same_window(existing_meta)
     fps_conflict = existing_meta is not None and abs(float(existing_meta.get("fps", config.fps)) - config.fps) > 1e-6
-    # Detection defaults to the source's own width now (the launch below passes no --width), and `analyze_segment`
-    # refuses to resume results from another width into one directory - so a width mismatch supersedes like a window
-    # or rate one. A meta without `detect_width` predates the full-resolution default: it was analyzed at 1920.
-    stored_width = int(existing_meta.get("detect_width", 1920)) if existing_meta is not None else 0
-    width_conflict = existing_meta is not None and stored_width != int(probe.width)
+    # Detection width is a launch choice (full resolution or the 1920-wide Fast mode), and `analyze_segment` refuses
+    # to resume results from another width into one directory - so a width mismatch supersedes like a window or rate
+    # one. A meta without `detect_width` predates the full-resolution default: it was analyzed at 1920.
+    stored_width = stored_width_now
+    width_conflict = existing_meta is not None and stored_width != int(analysis_width)
 
     info_col, run_col = st.columns([2, 1])
     with info_col:
@@ -3147,8 +3178,7 @@ else:
                 f"This video already has results for **{stored}**. There is one output directory per video, and a "
                 "different window, analysis rate or detection width cannot be resumed into the same one - running "
                 f"again (this run: {_clock(window_start)} to {_clock(window_end)} at {config.fps:g} fps, detecting "
-                f"at the source's own {int(probe.width)} px) will move the existing results aside (renamed, not "
-                "deleted)."
+                f"at {analysis_width} px) will move the existing results aside (renamed, not deleted)."
             )
         _stage_a_status(segment_dir, watch_key=f"stage_a_watch::{chosen}")
     with run_col:
@@ -3178,8 +3208,8 @@ else:
                 )
             # The match record keeps the segment list, which is what `summaries` and the rebuild scripts read.
             library.add_segment(record_id, segment_dir)
-            # No --width: the pass detects at the source's own width, the full-resolution default. A saved segment
-            # from the old 1920 default was superseded above, so the run cannot collide with it.
+            # The chosen width travels explicitly: the stored meta is what the resume/conflict checks read, and a
+            # Fast run must not silently resume full-resolution chunks or vice versa.
             command = [
                 sys.executable,
                 str(REPO_ROOT / "scripts" / "run_stage_a.py"),
@@ -3187,7 +3217,10 @@ else:
                 "--out", str(segment_dir),
                 "--start", str(start_s),
                 "--duration", str(duration_s),
+                "--width", str(analysis_width),
             ]
+            if not use_log_motion:
+                command.append("--no-log-motion")
             subprocess.Popen(command, cwd=str(REPO_ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             st.session_state["step1_flash"] = (
                 "success",

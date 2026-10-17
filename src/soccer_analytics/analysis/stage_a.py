@@ -28,6 +28,7 @@ import cv2
 import numpy as np
 
 from soccer_analytics.analysis.kit import DESCRIPTOR_SIZE, frame_grass_window, kit_descriptor
+from soccer_analytics.analysis.log_motion import LogMotion, install_log_gmc
 from soccer_analytics.geometry.camera_motion import (
     DEFAULT_FOCAL,
     CameraMotionTracker,
@@ -109,6 +110,10 @@ class SegmentConfig:
     confidence: float = PERSON_CONF
     weights: str = "yolov8n.pt"  # stock COCO name: Ultralytics fetches it on first use, so a fresh clone runs
     device: str | int = 0
+    # When a gimbal log is found, reuse the camera-motion step Stage A already measured for BoT-SORT's
+    # compensation instead of making the tracker estimate it again at full resolution. The log fills gaps where
+    # the chain step was lost. Off means the tracker keeps its own optical-flow GMC.
+    use_log_motion: bool = True
 
 
 def resolve_weights(weights: str | None = None) -> str:
@@ -248,7 +253,15 @@ def detect_people(model, frame: np.ndarray, config: SegmentConfig, ignore: np.nd
     return out
 
 
-def track_people(model, frame: np.ndarray, config: SegmentConfig, ignore: np.ndarray) -> list[tuple]:
+def track_people(
+    model,
+    frame: np.ndarray,
+    config: SegmentConfig,
+    ignore: np.ndarray,
+    *,
+    log_motion: LogMotion | None = None,
+    frame_index: int = -1,
+) -> list[tuple]:
     """Tracked person boxes ``(x1, y1, x2, y2, conf, track_id)``; the identity is BoT-SORT's, not the caller's.
 
     Tracking runs on the same frame the detector sees, so the boxes are the detector's own - the tracker only
@@ -257,8 +270,12 @@ def track_people(model, frame: np.ndarray, config: SegmentConfig, ignore: np.nda
     observations rather than continuations.
 
     The tracker is stateful and must persist across frames of one segment (``persist=True``); it is created on the
-    first call and reused, which is what makes an identity survive a chunk boundary.
+    first call and reused, which is what makes an identity survive a chunk boundary. When ``log_motion`` is
+    available, its warp replaces the tracker's own full-resolution optical-flow GMC after the model is fitted.
     """
+    gmc = getattr(model, "_log_gmc", None)
+    if gmc is not None:
+        gmc.frame_index = int(frame_index)
     result = model.track(
         frame,
         persist=True,
@@ -269,6 +286,13 @@ def track_people(model, frame: np.ndarray, config: SegmentConfig, ignore: np.nda
         device=config.device,
         verbose=False,
     )[0]
+    if log_motion is not None and getattr(model, "_log_motion", None) is not log_motion:
+        # The first call above is what makes the predictor create its tracker. From the next frame on, the
+        # tracker's GMC is the logged warp (or the old GMC until the pan model is ready).
+        installed = install_log_gmc(model, log_motion)
+        if installed is not None:
+            model._log_gmc = installed
+            model._log_motion = log_motion
     boxes = result.boxes.xyxy.cpu().numpy()
     confs = result.boxes.conf.cpu().numpy()
     ids = result.boxes.id
@@ -345,6 +369,9 @@ def analyze_segment(
         from ultralytics import YOLO
 
         model = YOLO(resolve_weights(config.weights))
+    for attribute in ("_log_gmc", "_log_motion"):
+        if hasattr(model, attribute):
+            delattr(model, attribute)
 
     first_chunk = completed_chunks(out_dir)
     started = time.time()
@@ -367,6 +394,18 @@ def analyze_segment(
     if first_chunk > 0:
         chain = _restore_chain(out_dir, first_chunk, probe)
     tracker = CameraMotionTracker((motion_height, config.motion_width), chain=chain)
+    detect_height = int(round(config.detect_width * probe.height / probe.width)) // 2 * 2
+    log_motion = (
+        LogMotion.for_source(
+            meta,
+            total_frames,
+            frame_offset=first_chunk * config.chunk_frames,
+            width=config.detect_width,
+            height=detect_height,
+        )
+        if config.use_log_motion
+        else None
+    )
 
     # On resume, decode one extra frame *before* the resume point. It is the frame the restored chain belongs to
     # (the last frame of the previous chunk), so seeding the tracker with it keeps the motion across the chunk
@@ -400,14 +439,26 @@ def analyze_segment(
             lost_total += 0 if state.ok else 1
 
             frame_idx = frames_in_chunk
+            analysis_index = first_chunk * config.chunk_frames + frame_idx
             rows["time"].append(source_time)
             rows["ok"].append(state.ok)
             rows["inlier"].append(state.inlier_ratio)
             rows["step"].append(state.step if state.step is not None else np.eye(3))
             rows["focal"].append(state.focal)
+            if log_motion is not None:
+                log_motion.observe_chain(analysis_index, tracker.chain.q, state.focal, state.ok, state.step)
+                log_motion.add_pose(tracker.chain.q, state.ok)
 
             grass = frame_grass_window(frame)
-            for x1, y1, x2, y2, conf, tid in track_people(model, frame, config, ignore_mask):
+            tracked = track_people(
+                model,
+                frame,
+                config,
+                ignore_mask,
+                log_motion=log_motion,
+                frame_index=analysis_index,
+            )
+            for x1, y1, x2, y2, conf, tid in tracked:
                 width = frame.shape[1]
                 rows["det_frame"].append(frame_idx)
                 rows["det_box"].append((x1, y1, x2, y2))

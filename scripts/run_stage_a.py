@@ -47,6 +47,11 @@ def main() -> int:
     )
     parser.add_argument("--chunk-frames", type=int, default=300, help="frames per checkpoint file")
     parser.add_argument(
+        "--no-log-motion",
+        action="store_true",
+        help="ignore the gimbal log for tracker motion compensation (use BoT-SORT's optical-flow GMC)",
+    )
+    parser.add_argument(
         "--weights",
         default=None,
         help="detection weights (default: a local data/models/*.pt if there is one, else stock yolov8n.pt)",
@@ -60,6 +65,7 @@ def main() -> int:
         chunk_frames=args.chunk_frames,
         weights=resolve_weights(args.weights),
         device="cpu" if args.cpu else 0,
+        use_log_motion=not args.no_log_motion,
     )
     status = analyze_segment(
         args.video,
