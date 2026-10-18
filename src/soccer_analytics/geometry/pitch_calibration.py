@@ -31,10 +31,13 @@ FOCAL_SCALE_RANGE = (0.6, 1.8)
 # A drift knot has four degrees of freedom (a rotation and a scale) while a click supplies two equations, so a knot
 # fitted to a *single* click stays free in the two directions that click cannot see. On the whole-game clicks that
 # freedom was enough to walk an anchor 21 deg off its neighbors with the residual still small - the anchors read as
-# the solver's private opinion, not as measurements. Two agreeing clicks pin the direction of a correction and the
-# smoothness term settles the rest, so a moment clicked once cannot anchor the drift (the UI asks for a second
-# landmark there; the click is still checked and reported, it is just not fitted).
-MIN_CLICKS_PER_ANCHOR = 2
+# the solver's private opinion, not as measurements. Two clicks give a knot exactly as many equations as unknowns
+# and no redundancy; on the 9v9 match two goal-post clicks close together let the rotation about that short baseline
+# wander, and projected goal lines were 40-60 px out at 1920 even though the posts themselves fitted. Three clicks
+# leave a check on the correction, and _drift_anchors also rejects a set whose pitch points are collinear (three
+# goal-line landmarks still say nothing about rotation about that line). A moment with fewer is still checked and
+# reported; it just cannot move the drift.
+MIN_CLICKS_PER_ANCHOR = 3
 
 # Registering the base pose on one frame needs the classic four landmarks. Doing so pins the meter scale of every
 # reported distance on the moment the user trusts most, instead of pooling clicks across a span the chain had
@@ -208,11 +211,24 @@ def _reference_anchor(landmarks: list[Landmark], min_clicks: int = MIN_REFERENCE
 
 
 def _drift_anchors(landmarks: list[Landmark], min_clicks: int = MIN_CLICKS_PER_ANCHOR) -> list[Landmark]:
-    """The clicks offered to the drift fit: only frames whose knot a click count can identify (see MIN_CLICKS_PER_ANCHOR)."""
-    counts: dict[int, int] = {}
+    """The clicks offered to the drift fit: enough of them, and spread enough to identify a knot.
+
+    A count alone is not enough. Three goalposts and the corner beside them all sit on the goal line; the knot can
+    rotate about that line while every click still lands on its post, and the projected box then twists even though
+    the clicks themselves look healthy. The pitch points must span two dimensions, not just a line.
+    """
+    by_frame: dict[int, list[Landmark]] = {}
     for landmark in landmarks:
-        counts[landmark.frame] = counts.get(landmark.frame, 0) + 1
-    return [landmark for landmark in landmarks if counts[landmark.frame] >= min_clicks]
+        by_frame.setdefault(landmark.frame, []).append(landmark)
+    kept: list[Landmark] = []
+    for group in by_frame.values():
+        if len(group) < min_clicks:
+            continue
+        points = np.array([[lm.pitch_x, lm.pitch_y] for lm in group], dtype=np.float64)
+        if np.linalg.matrix_rank(points - points.mean(0), tol=0.5) < 2:
+            continue
+        kept.extend(group)
+    return kept
 
 
 def _plausible_registration(params: np.ndarray) -> bool:
@@ -717,7 +733,8 @@ def calibrate(
     look like an outlier because the chain had drifted away from it, and a gross mis-click would otherwise be able
     to bend the trajectory toward itself. The base pose itself is registered on the frame clicked most, when one
     frame carries at least four clicks (see ``_reference_anchor``); the correction is bounded and only fitted to
-    moments whose clicks can identify it (see ``MIN_CLICKS_PER_ANCHOR``), so a lone click cannot move the pose.
+    moments whose clicks can identify it (see ``MIN_CLICKS_PER_ANCHOR``), so a moment with too few clicks cannot
+    move the pose.
     """
     if len(landmarks) < 4:
         raise CalibrationError("need at least 4 landmarks (each gives 2 equations for 7 unknowns)")

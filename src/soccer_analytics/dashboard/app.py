@@ -1230,6 +1230,11 @@ def saved_calibration(
     if expected_source is not None and clicks_source is not None:
         if Path(clicks_source).resolve() != Path(expected_source).resolve():
             return None
+    clicks_pitch = library.load_clicks_pitch(match_id)
+    if clicks_pitch is not None:
+        record = library.load(match_id)
+        if abs(float(record.pitch_length_m) - clicks_pitch[0]) > 0.05 or abs(float(record.pitch_width_m) - clicks_pitch[1]) > 0.05:
+            return None
     return library.load_calibration(match_id)
 
 
@@ -3280,12 +3285,37 @@ if segment is not None:
     # dimensions, so reading them back from the record is what stops the two drifting apart across reloads.
     record = library.load(match_id)
     stored_format = record.format if record.format in MATCH_FORMATS else list(MATCH_FORMATS)[-2]
-    format_col, _ = st.columns([1, 3])
+    format_col, length_col, width_col = st.columns([2, 1, 1])
     with format_col:
         format_name = st.selectbox(
             "Match format", list(MATCH_FORMATS), index=list(MATCH_FORMATS).index(stored_format)
         )
-    length_m, width_m = MATCH_FORMATS[format_name]
+    # Youth pitches are marked to the format's convention but not to a surveyor's tolerance. The format supplies
+    # the templates (markings, landmark list); these two numbers are what the click coordinates are actually built
+    # from, so a field measured at 64 x 42 m is calibrated as 64 x 42 m instead of being forced onto 60 x 40.
+    default_length, default_width = MATCH_FORMATS[format_name]
+    if record.format == format_name:
+        default_length, default_width = record.pitch_length_m, record.pitch_width_m
+    with length_col:
+        length_m = st.number_input(
+            "Pitch length (m)",
+            min_value=20.0,
+            max_value=120.0,
+            value=float(default_length),
+            step=0.5,
+            key=f"pitch_length::{match_id}::{format_name}",
+            help="Measure along a touchline, goal line to goal line. The format only supplies the default.",
+        )
+    with width_col:
+        width_m = st.number_input(
+            "Pitch width (m)",
+            min_value=15.0,
+            max_value=80.0,
+            value=float(default_width),
+            step=0.5,
+            key=f"pitch_width::{match_id}::{format_name}",
+            help="Measure across the pitch, touchline to touchline.",
+        )
     markings = markings_for(format_name)
     markings_detail = (
         f"{markings.penalty_area_width_m:.2f} x {markings.penalty_area_depth_m:.2f} m penalty area"
@@ -3306,6 +3336,7 @@ if segment is not None:
         had_calibration = library.load_calibration(match_id) is not None
         record.format, record.pitch_length_m, record.pitch_width_m = format_name, length_m, width_m
         library.save(record)
+        st.session_state.pop("calibration", None)
         if had_calibration:
             st.warning(
                 "The pitch size changed after this match was calibrated, so the saved calibration no longer matches. "
@@ -3325,10 +3356,14 @@ if segment is not None:
     # new session, and the whole point of the saved set is to outlive the browser tab. Frames are indices into the
     # segment they were clicked on, so a set from another segment is refused (restored_points) rather than
     # renumbered into nonsense.
-    clicks_key = f"{match_id}|{chosen}|{format_name}"
+    clicks_key = f"{match_id}|{chosen}|{format_name}|{length_m:.3f}|{width_m:.3f}"
     if st.session_state.get("calib_clicks_key") != clicks_key:
         saved_clicks = library.load_clicks(match_id)
         saved_source = library.load_clicks_source(match_id)
+        saved_pitch = library.load_clicks_pitch(match_id)
+        same_pitch = saved_pitch is None or (
+            abs(saved_pitch[0] - length_m) < 0.05 and abs(saved_pitch[1] - width_m) < 0.05
+        )
         # Frames are indices into the recording the clicks were made on. Restoring a set made on one clip while a
         # different video is open puts the same frame number on different pictures; the fit then looks like a bad
         # calibration and (worse) can overwrite the good one on disk. New sets name their source. Legacy sets have
@@ -3338,7 +3373,9 @@ if segment is not None:
             same_source = Path(saved_source).resolve() == Path(chosen).resolve()
         else:
             same_source = any(Path(source).resolve() == Path(chosen).resolve() for source in record.sources)
-        restored = restored_points(saved_clicks, frame_count) if saved_clicks and same_source else None
+        restored = (
+            restored_points(saved_clicks, frame_count) if saved_clicks and same_source and same_pitch else None
+        )
         if restored:
             # A format that has no centre circle (5v5/7v7) also has no landmark by that name. A set saved before
             # the format-aware tables could still carry one; keep the click but let the user re-label it rather
@@ -3356,7 +3393,12 @@ if segment is not None:
         st.session_state["calib_zoom"] = DEFAULT_ZOOM
         st.session_state["calib_reference"] = int(restored[0]["frame"]) if restored else 0
         st.session_state.pop("calibration", None)
-        if saved_clicks and saved_source and not same_source:
+        if saved_clicks and not same_pitch:
+            st.session_state["calib_restore_note"] = (
+                "The saved clicks were labelled against a different pitch size, so they were not restored. "
+                "Re-click the landmarks on this pitch size."
+            )
+        elif saved_clicks and saved_source and not same_source:
             st.session_state["calib_restore_note"] = (
                 f"The saved clicks were made on `{Path(saved_source).name}`, not this match's analyzed footage. "
                 "They are not restored against a different recording - recalibrate on the analyzed footage."
@@ -3809,12 +3851,26 @@ are sure of.
                         "- registering on one moment is steadier."
                     )
                 sparse = [frame for frame in frames_with_clicks if counts[frame] < MIN_CLICKS_PER_ANCHOR]
-                if sparse:
+                collinear = []
+                for frame in frames_with_clicks:
+                    points = [
+                        land_table[label]
+                        for point, label in labeled
+                        if point["frame"] == frame and label in land_table
+                    ]
+                    if len(points) >= MIN_CLICKS_PER_ANCHOR:
+                        pitch_points = np.asarray(points, dtype=np.float64)
+                        if np.linalg.matrix_rank(pitch_points - pitch_points.mean(0), tol=0.5) < 2:
+                            collinear.append(frame)
+                weak = sorted(set(sparse) | set(collinear))
+                if weak:
                     st.info(
-                        "One click each at frames " + ", ".join(str(frame) for frame in sparse) + ". A single click "
-                        "cannot pin a moment's correction - its ray is not enough to fix the two directions the "
-                        "correction moves in - so add one more landmark at each of those moments to anchor the drift "
-                        "there."
+                        "Not enough spread to anchor the drift at frame(s) "
+                        + ", ".join(str(frame) for frame in weak)
+                        + f". A correction there has four unknowns: {MIN_CLICKS_PER_ANCHOR} landmarks spread "
+                        "across the pitch give it a check, while fewer - or several on one goal line - let it "
+                        "twist the projection away from the markings. Add a landmark off that line at those "
+                        "moments."
                     )
 
             if len(labeled) < 4:

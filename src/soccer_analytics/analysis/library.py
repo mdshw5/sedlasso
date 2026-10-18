@@ -451,6 +451,21 @@ class MatchLibrary:
         source = json.loads(path.read_text()).get("source")
         return str(source) if source else None
 
+    def load_clicks_pitch(self, match_id: str) -> tuple[float, float] | None:
+        """The pitch dimensions the saved clicks were labelled against, or ``None`` for a legacy set.
+
+        Youth pitches vary, and a click on "corner far-left" means (L, W), not (60, 40). A set whose dimensions no
+        longer match the match record cannot be reused without relabelling: the same pixel would claim a different
+        world point.
+        """
+        path = self.path(match_id) / "clicks.json"
+        if not path.exists():
+            return None
+        pitch = json.loads(path.read_text()).get("pitch")
+        if not pitch or len(pitch) != 2:
+            return None
+        return float(pitch[0]), float(pitch[1])
+
     def save_report(self, match_id: str, payload: dict) -> Path:
         path = self.path(match_id) / "report.json"
         _atomic_write(path, payload)

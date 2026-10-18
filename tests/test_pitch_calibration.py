@@ -311,6 +311,42 @@ def test_six_clicks_can_now_shed_a_bad_one() -> None:
     assert len(calibration.excluded) == 1, "a six-click set should be able to flag its worst click"
 
 
+def test_goal_line_clicks_cannot_anchor_a_correction() -> None:
+    """Three landmarks can still be collinear, and then they say nothing about rotation about that line.
+
+    This is the 9v9 case: the corner flag and both posts on one goal line were enough clicks to pass a count rule,
+    but the goal box still projected 40-60 px wrong at 1920. The knot has to span two pitch dimensions.
+    """
+    from soccer_analytics.geometry.pitch_calibration import _drift_anchors
+
+    collinear = [
+        Landmark(10, 0.1, 0.1, 60.0, 0.0, "corner near-right"),
+        Landmark(10, 0.2, 0.1, 60.0, 17.56, "goal post right-near"),
+        Landmark(10, 0.3, 0.1, 60.0, 22.44, "goal post right-far"),
+    ]
+    assert _drift_anchors(collinear) == []
+
+    spread = collinear + [Landmark(10, 0.4, 0.2, 36.4, 20.0, "center circle right")]
+    assert len(_drift_anchors(spread)) == 4
+
+
+def test_two_clicks_cannot_anchor_a_correction() -> None:
+    """Two close landmarks (a pair of goalposts) fit four unknowns exactly, with no redundancy left to check it.
+
+    On the 9v9 match those two-click goal anchors let the correction twist the goal box 40-60 px while still
+    landing on the posts. A moment needs a third landmark before it may move the drift.
+    """
+    from soccer_analytics.geometry.pitch_calibration import MIN_CLICKS_PER_ANCHOR
+
+    assert MIN_CLICKS_PER_ANCHOR == 3
+
+    landmarks, chain = _clicks({0: 0.0, 1: 35.0}, noise_px=1.0, seed=6)
+    first = [lm for lm in landmarks if lm.frame == 0]
+    two = [lm for lm in landmarks if lm.frame == 1][:2]
+    calibration = calibrate(first + two, chain, ASPECT)
+    assert calibration.drift is None or 1 not in calibration.drift.frames
+
+
 def test_a_lone_click_cannot_anchor_a_correction() -> None:
     """One click at its own moment gets no knot: two equations against four unknowns would be a private opinion.
 
