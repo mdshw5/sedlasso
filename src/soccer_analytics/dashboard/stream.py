@@ -55,14 +55,16 @@ from soccer_analytics.dashboard.video import (
     DEFAULT_LIVE_WIDTH,
     MAX_CLIP_SECONDS,
     MAX_VIDEO_WIDTH,
+    DIRECT_DISPLAY_FPS,
     VideoError,
     clip_key,
     encode_clip,
+    iter_direct_mjpeg_frames,
     iter_live_chunks,
 )
 from soccer_analytics.geometry.pitch_calibration import pitch_to_pixels
 from soccer_analytics.ingest.ffmpeg_reader import grab_frame
-from soccer_analytics.ingest.source import open_reader, source_from_record
+from soccer_analytics.ingest.source import as_source, open_reader, source_from_record
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 MATCHES_ROOT = REPO_ROOT / "data" / "matches"
@@ -1098,12 +1100,32 @@ def iter_annotated_frames(
     which is what keeps a 4x stream honest.
 
     ``overlays`` selects the drawn layers (:func:`parse_overlays`); ``None`` keeps every layer on, which is what
-    every caller that does not think about overlays expects. ``control``, when given, is checked between frames
-    so a client can end its own stream (see :class:`StreamControl`). ``pace`` is the real-time throttle (a
-    testing seam turns it off); when the decode falls behind, pacing simply yields to it.
+    every caller that does not think about overlays expects. With every layer off the picture is the recording
+    itself, so ffmpeg reads, samples and JPEG-encodes the source directly (``iter_direct_mjpeg_frames``) - no
+    Python decode and no OpenCV render. ``control``, when given, is checked between frames so a client can end
+    its own stream (see :class:`StreamControl`). ``pace`` is the real-time throttle (a testing seam turns it
+    off); when the decode falls behind, pacing simply yields to it.
     """
     layers = ALL_OVERLAYS if overlays is None else overlays
     index = match.index_for(start_s)
+    if not any(layers.values()) and reader_factory is open_reader:
+        try:
+            as_source(match.video)
+        except (OSError, ValueError):
+            pass  # a missing source falls through to the reader, whose error message is the better one
+        else:
+            try:
+                for sent, jpeg in enumerate(
+                    iter_direct_mjpeg_frames(
+                        match, start_s=start_s, width=width, control=control, pace=pace, rate=rate
+                    )
+                ):
+                    if control is not None and control.stopped:
+                        return
+                    yield sent, jpeg
+            except VideoError as error:
+                raise StreamError(f"the direct stream failed: {error}") from error
+            return
     decode_start = match.source_time(index)
     remaining_s = (match.frame_count - index) / match.fps
     reader = reader_factory(
@@ -1403,7 +1425,7 @@ class MatchStreamHandler(BaseHTTPRequestHandler):
             frames = row.get("frame_count") or 0
             fps = row.get("fps") or 5.0
             base = f"/play/{name}?start={start:.1f}"
-            links = " ".join(f"<a href='{base}&rate={rate}'>{rate:g}x</a>" for rate in (1, 2, 4))
+            links = " ".join(f"<a href='{base}&rate={rate}'>{rate:g}x</a>" for rate in (1, 2, 4, 8))
             # A still, not a live <img> of the stream: an index that opened a decode per card would run one
             # ffmpeg for as long as the tab stayed open, for a picture nobody asked to play.
             preview_t = start + 30.0 if end and end - start > 60 else start
@@ -1621,7 +1643,12 @@ class MatchStreamHandler(BaseHTTPRequestHandler):
         audio = self._flag(query, "audio", default=True)
         codec = self._codec(query)
         overlay_layers = parse_overlays(query.get("overlays"))
-        key = clip_key(match_id, start_s, duration, fps, width, overlay_layers, rate, audio, codec)
+        sample_fps = fps
+        if rate > 1.0:
+            # A faster clip keeps a 60 fps timeline: 4x samples 15 source fps, 8x samples 7.5. Encoding all 60
+            # source frames into a 240/480 fps file would cost more and play worse on every player.
+            sample_fps = max(1.0, min(fps, DIRECT_DISPLAY_FPS / rate))
+        key = clip_key(match_id, start_s, duration, sample_fps, width, overlay_layers, rate, audio, codec)
         path = self.server.clip_cache.lookup(key)
         if path is None:
             if not self.server.stream_slots.acquire(timeout=STREAM_SLOT_WAIT_S):
@@ -1637,7 +1664,7 @@ class MatchStreamHandler(BaseHTTPRequestHandler):
                                 session,
                                 start_s=start_s,
                                 duration_s=duration,
-                                fps=fps,
+                                fps=sample_fps,
                                 width=width,
                                 overlays=overlay_layers,
                                 output=target,

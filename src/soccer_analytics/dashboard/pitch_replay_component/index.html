@@ -253,6 +253,7 @@
         <option value="1" selected>1x</option>
         <option value="2">2x</option>
         <option value="4">4x</option>
+        <option value="8">8x</option>
       </select>
       <label class="toggle"><input id="loop" type="checkbox" /> loop</label>
       <label class="toggle"><input id="trails" type="checkbox" checked /> trails</label>
@@ -260,16 +261,16 @@
         ><input id="sync" type="checkbox" checked /> sync footage</label>
       <label class="toggle" title="Match audio (the footage starts muted: browsers block sound until asked)"
         ><input id="sound" type="checkbox" /> sound</label>
-      <span class="group" title="What the annotated footage draws - the pitch markers above are unaffected except that debug also names their tracks">
+      <span class="group" title="What the footage draws - off by default so review shows the game itself; the pitch markers above are unaffected except that debug also names their tracks">
         <span class="group-title">footage:</span>
-        <label class="toggle"><input id="ov-pitch" type="checkbox" checked /> lines</label>
-        <label class="toggle"><input id="ov-boxes" type="checkbox" checked /> boxes</label>
-        <label class="toggle"><input id="ov-numbers" type="checkbox" checked /> numbers</label>
-        <label class="toggle"><input id="ov-ball" type="checkbox" checked /> ball</label>
-        <label class="toggle"><input id="ov-hud" type="checkbox" checked /> clock</label>
+        <label class="toggle"><input id="ov-pitch" type="checkbox" /> lines</label>
+        <label class="toggle"><input id="ov-boxes" type="checkbox" /> boxes</label>
+        <label class="toggle"><input id="ov-numbers" type="checkbox" /> numbers</label>
+        <label class="toggle"><input id="ov-ball" type="checkbox" /> ball</label>
+        <label class="toggle"><input id="ov-hud" type="checkbox" /> clock</label>
         <label class="toggle"
           title="Session name, frame counter, track ids (on the footage and the pitch markers above) and the notes about what was left out"
-          ><input id="ov-debug" type="checkbox" checked /> debug</label>
+          ><input id="ov-debug" type="checkbox" /> debug</label>
       </span>
       <label class="toggle"
         >heat
@@ -428,7 +429,9 @@
         // would. "hud" is the watching set (teams, clock), "debug" the diagnosing set (session name, frame
         // counter, track ids, notes). Debug is also the one layer the pitch reads: the markers' #track_id labels
         // are the tracker's own keys - debug information on the stream as well - so they come and go with it.
-        footageOverlays: {pitch: true, boxes: true, numbers: true, ball: true, hud: true, debug: true},
+        // EVERYTHING IS OFF BY DEFAULT: this pane is for watching and manually tagging the game, and the clean
+        // picture is both what the eye needs and what lets the server take the direct ffmpeg path.
+        footageOverlays: {pitch: false, boxes: false, numbers: false, ball: false, hud: false, debug: false},
         footageKind: '', // what the pane currently shows: '' | 'still' | 'stream'
         // Which transport the pane plays: 'video' is the encoded /live stream (full rate, audio, a measurable
         // clock); 'mjpeg' is the /stream MJPEG in the pane's own <img> - the fallback for WebKit-family

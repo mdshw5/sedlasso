@@ -25,17 +25,22 @@ from soccer_analytics.dashboard.stream import (
     OVERLAY_NAMES,
     StreamControl,
     TeamStyle,
+    iter_annotated_frames,
     slerp_rotation,
 )
 from soccer_analytics.dashboard.video import (
     ClipCache,
     VideoError,
     clip_key,
+    direct_encoder_command,
+    direct_mjpeg_command,
+    direct_sample_fps,
     encode_clip,
     encoder_command,
     iter_live_chunks,
     pick_encoder,
 )
+from soccer_analytics.ingest.source import WindowPiece
 
 NO_LAYERS = {name: False for name in OVERLAY_NAMES}
 
@@ -192,6 +197,80 @@ def test_the_live_command_fragments_and_the_clip_command_seeks() -> None:
     assert "+faststart" in clip and clip[-1] == "/tmp/x.mp4"
     assert clip[clip.index("-g") + 1] == "60"
     assert "libx264" in clip and "medium" in clip, "the CPU fallback gets the denser preset"
+
+
+def test_the_direct_playback_command_samples_the_frames_each_speed_needs_and_keeps_audio() -> None:
+    """The direct path reads the recording itself and gives the encoder only the frames a viewer can see:
+    a constant 60 fps timeline needs 60 source fps at 1x, 30 at 2x, 15 at 4x and 7.5 at 8x. Audio rides
+    along at every speed (`atempo`), and high speeds also tell the decoder to skip frames it cannot show."""
+    pieces = [WindowPiece("/archive/game.mp4", 1.25, 10.0)]
+    for rate, sample in ((1.0, 60.0), (2.0, 30.0), (4.0, 15.0), (8.0, 7.5)):
+        command = direct_encoder_command(
+            pieces,
+            rate=rate,
+            width=1600,
+            live=True,
+            encoder="h264_nvenc",
+            source_fps=60.0,
+            audio_pieces=pieces,
+        )
+        joined = " ".join(command)
+        assert f"fps={sample:g}" in joined, f"{rate:g}x must sample {sample:g} source fps"
+        assert f"setpts=PTS/{rate:g}" in joined, "the output timeline is retimed to the requested speed"
+        assert f"-readrate {rate:g}" in joined, "the source is read at playback speed, not buffered"
+        assert "-map 0:a:0?" in joined and "-c:a aac" in joined, "the match audio rides along"
+        if rate > 1:
+            assert "atempo" in joined, "the soundtrack is retimed with the picture"
+        else:
+            assert "-filter:a" not in joined, "1x audio needs no retiming"
+        assert command[-1] == "pipe:1"
+    assert direct_sample_fps(8.0, 60.0) == pytest.approx(7.5)
+    fast = " ".join(
+        direct_encoder_command(pieces, rate=8.0, source_fps=60.0, encoder="libx264", audio_pieces=pieces)
+    )
+    assert "-skip_frame nokey" in fast, "8x decodes only keyframes; the encoder still fills 60 fps"
+    medium = " ".join(
+        direct_encoder_command(pieces, rate=4.0, source_fps=60.0, encoder="libx264", audio_pieces=pieces)
+    )
+    assert "-skip_frame nointra" in medium, "4x cannot decode every frame in time either"
+    smooth = " ".join(
+        direct_encoder_command(pieces, rate=2.0, source_fps=60.0, encoder="libx264", audio_pieces=pieces)
+    )
+    assert "-skip_frame" not in smooth, "2x decodes everything: it keeps up and looks best"
+
+
+def test_the_direct_playback_command_joins_clips_and_keeps_audio_across_the_join() -> None:
+    """A never-merged game is a clip set, so the direct path seeks each clip locally and lets ffmpeg's
+    ``concat`` filter stitch both the picture and the sound - no second encode, no silent seam."""
+    pieces = [WindowPiece("/clips/a.mp4", 1.25, 0.75), WindowPiece("/clips/b.mp4", 0.0, 1.5)]
+    command = direct_encoder_command(
+        pieces,
+        rate=2.0,
+        width=1600,
+        live=True,
+        encoder="h264_nvenc",
+        source_fps=60.0,
+        audio_pieces=pieces,
+    )
+    joined = " ".join(command)
+    assert "-ss 1.250 -t 0.750 -i /clips/a.mp4" in joined
+    assert "-ss 0.000 -t 1.500 -i /clips/b.mp4" in joined
+    assert "[0:v:0]fps=30" in joined and "[1:v:0]fps=30" in joined
+    assert "concat=n=2:v=1:a=0,setpts=PTS/2[vout]" in joined
+    assert "[0:a:0]aresample=async=1[a0]" in joined
+    assert "concat=n=2:v=0:a=1,atempo=2.0000[aout]" in joined
+    assert "-map [vout]" in joined and "-map [aout]" in joined
+
+
+def test_the_direct_mjpeg_command_drops_frames_a_high_speed_cannot_show() -> None:
+    """The fallback transport uses the same sampling: 8x needs 7.5 source frames a second for a 60 fps
+    MJPEG push, and the JPEG encoder only ever sees those."""
+    pieces = [WindowPiece("/archive/game.mp4", 0.0, 10.0)]
+    command = direct_mjpeg_command(pieces, rate=8.0, width=1280, source_fps=60.0)
+    joined = " ".join(command)
+    assert "fps=7.5" in joined and "setpts=PTS/8" in joined
+    assert "-c:v mjpeg" in joined and "-f image2pipe pipe:1" in joined
+    assert "-an" in joined, "MJPEG carries no audio; the <img> fallback is silent"
 
 
 def test_the_source_audio_rides_along_and_retimes_with_the_rate() -> None:
@@ -524,6 +603,22 @@ def test_the_play_page_picks_the_element_each_format_plays_in(tmp_path) -> None:
 needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is what is under test")
 
 
+def _tone_source(tmp_path: Path, *, seconds: float = 2.0) -> Path:
+    """A tiny real recording with a soundtrack, for the direct path's ffmpeg integration tests."""
+    source = tmp_path / "source.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", f"testsrc2=size=96x64:rate=30:duration={seconds:g}",
+            "-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds:g}",
+            "-shortest", "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", str(source),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return source
+
+
 class _TinyReader:
     """A reader with no video behind it: small frames on the match's own grid."""
 
@@ -644,6 +739,51 @@ def test_the_matchs_audio_really_rides_along_in_a_clip(tmp_path) -> None:
         audio=False,
     )
     assert not probe_video(muted).has_audio, "audio=0 leaves the clip silent"
+
+
+@needs_ffmpeg
+def test_the_direct_live_path_streams_sampled_h264_and_keeps_the_audio(tmp_path) -> None:
+    """The direct path end to end: a 2x request samples 30 source fps into a 60 fps fragmented MP4 and the
+    recording's own soundtrack comes with it - no decoded frame passes through Python."""
+    from soccer_analytics.ingest.ffmpeg_reader import probe_video
+
+    source = _tone_source(tmp_path, seconds=2.0)
+    match = _match(video=source, start_s=0.0, frame_count=10, native=(96, 64, 30.0))
+    payload = b"".join(
+        iter_live_chunks(
+            match,
+            start_s=0.0,
+            fps=30.0,
+            width=160,
+            overlays=dict(NO_LAYERS),
+            encoder="libx264",
+            pace=False,
+            rate=2.0,
+            audio=True,
+        )
+    )
+    assert payload[4:8] == b"ftyp" and b"moof" in payload
+    output = tmp_path / "direct.mp4"
+    output.write_bytes(payload)
+    probe = probe_video(output)
+    assert probe.fps == pytest.approx(60.0, abs=1.0), "the output timeline stays at 60 fps"
+    assert probe.duration_s == pytest.approx(1.0, abs=0.25), "2 source seconds at 2x"
+    assert probe.has_audio, "the match audio must ride along"
+
+
+@needs_ffmpeg
+def test_the_direct_mjpeg_path_really_emits_jpegs_without_a_python_render(tmp_path) -> None:
+    """The MJPEG fallback gets the same treatment: ffmpeg decodes, samples and JPEG-encodes; Python only
+    splits the byte stream into pictures the multipart writer can frame."""
+    source = _tone_source(tmp_path, seconds=2.0)
+    match = _match(video=source, start_s=0.0, frame_count=10, native=(96, 64, 30.0))
+    frames = list(
+        iter_annotated_frames(
+            match, 0.0, rate=2.0, width=160, overlays=dict(NO_LAYERS), pace=False
+        )
+    )
+    assert len(frames) >= 20, "the 2x push should carry most of a second of 60 fps pictures"
+    assert all(jpeg.startswith(b"\xff\xd8") and jpeg.endswith(b"\xff\xd9") for _index, jpeg in frames)
 
 
 @needs_ffmpeg

@@ -342,6 +342,21 @@ def test_a_button_restarts_the_footage_at_the_animation_second() -> None:
     assert "state.footageSync = true" in handler, "restarting re-couples sync if it was off"
 
 
+def test_the_footage_opens_clean_and_offers_eight_times_speed() -> None:
+    """The pane is for watching and manually tagging the game, so its default picture is the game itself -
+    every layer off. That is also what lets the server take the direct ffmpeg path, and 8x is the speed that
+    path exists for."""
+    html = COMPONENT.read_text()
+    assert (
+        "footageOverlays: {pitch: false, boxes: false, numbers: false, ball: false, hud: false, debug: false}"
+        in html
+    ), "the footage must start without overlays"
+    for ident in ("ov-pitch", "ov-boxes", "ov-numbers", "ov-ball", "ov-hud", "ov-debug"):
+        line = next(line for line in html.splitlines() if f'id="{ident}"' in line)
+        assert "checked" not in line, f"{ident} must default to off"
+    assert '<option value="8">8x</option>' in html, "8x playback is part of the direct path"
+
+
 def test_the_footage_overlay_toggles_choose_the_layers() -> None:
     """The footage is drawn server-side, so each toggle is a query parameter on the stream *and* the still URLs:
     switching one off reopens the pane at the animation's own second with the new layer set, rather than leaving

@@ -31,7 +31,7 @@ from pathlib import Path
 
 import numpy as np
 
-from soccer_analytics.ingest.ffmpeg_reader import probe_video
+from soccer_analytics.ingest.ffmpeg_reader import FFmpegError, probe_video
 from soccer_analytics.ingest.source import FileSource, as_source, open_reader, window_segments
 
 # Widths the encoded routes will serve. Above the MJPEG cap on purpose: this is the endpoint for the full
@@ -42,6 +42,10 @@ MAX_VIDEO_WIDTH = 3840
 DEFAULT_LIVE_WIDTH = 1920
 DEFAULT_CLIP_SECONDS = 10.0
 MAX_CLIP_SECONDS = 300.0
+# The direct path (no overlays) targets this output timeline. The source is sampled at
+# ``min(source_fps, DISPLAY_FPS / rate)``, so a 60 fps camera gives 60 fps at 1x, 30 fps at 2x,
+# 15 fps at 4x and 7.5 fps at 8x - only the frames the viewer can actually see are encoded.
+DIRECT_DISPLAY_FPS = 60.0
 CLIP_CACHE_TTL_S = 900.0
 CLIP_CACHE_MAX = 8
 _CHUNK_BYTES = 64 * 1024
@@ -116,6 +120,193 @@ def encoder_quality_args(encoder: str, *, live: bool = False) -> list[str]:
     if "265" in encoder or "hevc" in encoder:
         return ["-preset", "veryfast" if live else "medium", "-crf", "25"]
     return ["-preset", "veryfast" if live else "medium", "-crf", "20"]
+
+
+def direct_sample_fps(rate: float, source_fps: float = 0.0, display_fps: float = DIRECT_DISPLAY_FPS) -> float:
+    """The source frames a second the direct path must sample to fill ``display_fps`` at this speed.
+
+    A speed above 1 needs fewer *source* frames for the same output rate (8x needs 7.5 of them to make 60), so
+    the frame-rate filter drops the rest before the encoder ever sees them. Slowing down cannot invent frames:
+    the sample rate is capped by the source's own, and the output timeline is then source_fps * rate.
+    """
+    wanted = max(0.1, float(display_fps) / max(0.01, float(rate)))
+    if source_fps and float(source_fps) > 0:
+        wanted = min(wanted, float(source_fps))
+    return max(1.0, round(wanted, 3))
+
+
+def direct_skip_frame(rate: float) -> str | None:
+    """Which source frames the decoder may skip entirely at this speed.
+
+    Sampling with ``fps`` happens *after* decode, and this box decodes 4K HEVC at roughly 3.2x realtime - so 1x
+    and 2x decode everything (2x needs 2 source seconds a real second and holds up), while 4x and 8x cannot
+    without a backlog. Those speeds decode keyframes only; at the camera's one-second GOP that is still 4-8
+    fresh pictures a second, plenty for the fast scrub they are used as. The frame-rate filter fills the 60 fps
+    output from what is decoded.
+    """
+    rate = float(rate)
+    if rate >= 8.0:
+        return "nokey"
+    if rate >= 4.0:
+        return "nointra"  # every I frame, not only IDR keyframes - the most a fast scrub can show in time
+    return None
+
+
+def _direct_input_args(pieces, *, rate: float, pace: bool, hwaccel: str = "auto") -> list[str]:
+    """One seekable input per clip piece: the clip resolver's contract (never seek the concat demuxer).
+
+    ``hwaccel="cuda"`` keeps decoded frames on the GPU (``scale_cuda`` and NVENC consume them without a
+    download/upload round trip); ``"auto"`` uses whatever decoder ffmpeg picks and copies frames back to
+    system memory, which is the portable path and the fallback when CUDA cannot open the stream.
+    """
+    if hwaccel == "cuda":
+        hardware = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+    elif hwaccel == "auto":
+        hardware = ["-hwaccel", "auto"]
+    else:
+        hardware = []
+    skip = direct_skip_frame(rate)
+    command: list[str] = []
+    for piece in pieces:
+        if pace:
+            # Read the source at the playback speed: ffmpeg then produces the output timeline in real time,
+            # which is what keeps the live stream near the live edge instead of buffering the whole match.
+            command += ["-readrate", f"{float(rate):g}"]
+        if skip:
+            command += ["-skip_frame", skip]
+        command += [
+            *hardware,
+            "-ss", f"{float(piece.start_s):.3f}",
+            "-t", f"{max(0.05, float(piece.duration_s)):.3f}",
+            "-i", str(piece.path),
+        ]
+    return command
+
+
+def _direct_video_chain(sample_fps: float, width: int, hwaccel: str = "auto") -> str:
+    """The per-input video filter: sample the needed frames, scale once, keep square pixels."""
+    if hwaccel == "cuda":
+        return f"fps={sample_fps:g},scale_cuda={max(2, int(width))}:-2,setsar=1"
+    return f"fps={sample_fps:g},scale='min(iw,{max(2, int(width))})':-2,setsar=1"
+
+
+def direct_encoder_command(
+    pieces,
+    *,
+    display_fps: float = DIRECT_DISPLAY_FPS,
+    rate: float = 1.0,
+    width: int = 1920,
+    live: bool = True,
+    encoder: str = "libx264",
+    codec: str = "h264",
+    source_fps: float = 0.0,
+    audio_pieces=None,
+    pace: bool = True,
+    output: str = "pipe:1",
+    hwaccel: str = "auto",
+) -> list[str]:
+    """The direct playback command: source file(s) in, one H.264/HEVC MP4 out - no Python frames in between.
+
+    Unlike :func:`encoder_command`, this reads the recording itself: ffmpeg seeks each clip, samples only the
+    frames the output rate needs (``fps`` before the encoder), retimes video with ``setpts`` and audio with
+    ``atempo``, and writes a fragmented MP4 straight to the pipe. ``pieces`` are game-clock windows resolved to
+    local clip slices (see :func:`window_segments`); ``audio_pieces`` must be the same list when sound is
+    wanted, or ``[]`` for a silent stream. The source's own soundtrack is always kept across a clip join by the
+    audio ``concat`` filter, and no call uses ``-shortest`` - a soundtrack shorter than the video cannot cut the
+    picture.
+
+    ``rate`` is the content speed (0.25-8x): 2x samples 30 source fps for a 60 fps timeline and stretches the
+    audio by 2, 8x samples 7.5 source fps and stretches it by 8. ``display_fps`` is the constant output rate.
+    """
+    video_pieces = [piece for piece in pieces if float(piece.duration_s) > 0]
+    if not video_pieces:
+        raise VideoError("the requested window has no footage")
+    audio = list(audio_pieces or [])
+    if len(audio) != len(video_pieces):
+        audio = []  # a partial soundtrack would shift every later input index: stay silent instead
+    has_audio = bool(audio)
+    n = len(video_pieces)
+    rate = max(0.01, float(rate))
+    sample_fps = direct_sample_fps(rate, source_fps, display_fps)
+    output_rate = max(1.0, sample_fps * rate)
+    gop = max(1, int(round(output_rate * (1.0 if live else 2.0))))
+
+    command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
+    command += _direct_input_args(video_pieces, rate=rate, pace=pace, hwaccel=hwaccel)
+
+    chain = _direct_video_chain(sample_fps, width, hwaccel)
+    if n == 1:
+        command += ["-vf", f"{chain},setpts=PTS/{rate:g}", "-map", "0:v:0"]
+        if has_audio:
+            command += ["-map", "0:a:0?"]
+            if abs(rate - 1.0) > 1e-6:
+                command += ["-filter:a", _atempo_chain(rate)]
+    else:
+        filters = [f"[{index}:v:0]{chain}[v{index}]" for index in range(n)]
+        joined = "".join(f"[v{index}]" for index in range(n))
+        filters.append(f"{joined}concat=n={n}:v=1:a=0,setpts=PTS/{rate:g}[vout]")
+        if has_audio:
+            filters += [f"[{index}:a:0]aresample=async=1[a{index}]" for index in range(n)]
+            audio_chain = "".join(f"[a{index}]" for index in range(n)) + f"concat=n={n}:v=0:a=1"
+            if abs(rate - 1.0) > 1e-6:
+                audio_chain += f",{_atempo_chain(rate)}"
+            filters.append(f"{audio_chain}[aout]")
+        command += ["-filter_complex", ";".join(filters), "-map", "[vout]"]
+        if has_audio:
+            command += ["-map", "[aout]"]
+    if has_audio:
+        command += ["-c:a", "aac", "-b:a", "128k"]
+    else:
+        command += ["-an"]
+
+    command += [
+        "-c:v", encoder, *encoder_quality_args(encoder, live=live),
+        "-g", str(gop), "-keyint_min", str(gop), "-r", f"{output_rate:g}",
+    ]
+    if hwaccel != "cuda":
+        command += ["-pix_fmt", "yuv420p"]
+    if "265" in encoder or "hevc" in encoder:
+        command += ["-tag:v", "hvc1"]
+    command += (
+        ["-movflags", "+frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", output]
+        if live
+        else ["-movflags", "+faststart", "-f", "mp4", output]
+    )
+    return command
+
+
+def direct_mjpeg_command(
+    pieces,
+    *,
+    display_fps: float = DIRECT_DISPLAY_FPS,
+    rate: float = 1.0,
+    width: int = 1600,
+    source_fps: float = 0.0,
+    pace: bool = True,
+) -> list[str]:
+    """The MJPEG fallback's direct command: sampled frames straight to JPEG, no OpenCV render at all."""
+    video_pieces = [piece for piece in pieces if float(piece.duration_s) > 0]
+    if not video_pieces:
+        raise VideoError("the requested window has no footage")
+    n = len(video_pieces)
+    rate = max(0.01, float(rate))
+    sample_fps = direct_sample_fps(rate, source_fps, display_fps)
+    output_rate = max(1.0, sample_fps * rate)
+    command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
+    command += _direct_input_args(video_pieces, rate=rate, pace=pace)
+    chain = _direct_video_chain(sample_fps, width)
+    if n == 1:
+        command += ["-vf", f"{chain},setpts=PTS/{rate:g}", "-map", "0:v:0"]
+    else:
+        filters = [f"[{index}:v:0]{chain}[v{index}]" for index in range(n)]
+        joined = "".join(f"[v{index}]" for index in range(n))
+        filters.append(f"{joined}concat=n={n}:v=1:a=0,setpts=PTS/{rate:g}[vout]")
+        command += ["-filter_complex", ";".join(filters), "-map", "[vout]"]
+    command += [
+        "-an", "-c:v", "mjpeg", "-q:v", "5", "-pix_fmt", "yuvj420p", "-r", f"{output_rate:g}",
+        "-f", "image2pipe", "pipe:1",
+    ]
+    return command
 
 
 def encoder_command(
@@ -302,6 +493,208 @@ def _audio_inputs(match, audio: bool, start_s: float, duration_s: float) -> list
     return pieces
 
 
+def direct_audio_pieces(source, start_s: float, duration_s: float) -> list:
+    """The soundtrack slices for the direct path, or ``[]`` when the recording has no usable audio.
+
+    One camera's clips share their format, so the first containing clip decides whether they all carry sound.
+    The direct command maps the same inputs as the video, so a partial soundtrack would misalign every later
+    input - silence is the honest answer then, not sound that drifts out of step with the picture.
+    """
+    try:
+        pieces = [
+            piece
+            for piece in window_segments(source, start_s, duration_s)
+            if Path(piece.path).exists()
+        ]
+        if not pieces:
+            return []
+        if not probe_video(pieces[0].path).has_audio:
+            return []
+    except (OSError, FFmpegError):
+        return []
+    return pieces
+
+
+def _direct_source_fps(match) -> float:
+    """The source's own rate for sampling, or 0 when the segment did not record it.
+
+    ``AnnotatedMatch.native_fps`` falls back to the analysis rate (5 fps on a real build), which is not a
+    playback rate; treating that as the cap would turn every stream into a slideshow, so only a plausible
+    source rate is used.
+    """
+    try:
+        fps = float(match.native_fps)
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
+    return fps if fps >= 10.0 else 0.0
+
+
+def _direct_pieces(match, start_s: float, duration_s: float) -> list:
+    """The clip slices a direct stream reads, resolved once per request."""
+    source = as_source(match.video)
+    pieces = window_segments(source, max(0.0, float(start_s)), max(0.1, float(duration_s)))
+    if not pieces:
+        raise VideoError("the requested window has no footage")
+    return pieces
+
+
+def _direct_process(command: list[str]) -> subprocess.Popen:
+    return subprocess.Popen(
+        command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+
+
+def iter_direct_live_chunks(
+    match,
+    *,
+    start_s: float,
+    width: int,
+    control=None,
+    encoder: str | None = None,
+    pace: bool = True,
+    rate: float = 1.0,
+    audio: bool = True,
+    codec: str = "h264",
+    display_fps: float = DIRECT_DISPLAY_FPS,
+):
+    """Yield a fragmented MP4 read straight from the recording - no decoded frame ever enters Python.
+
+    The direct sibling of :func:`iter_live_chunks`, used when nothing has to be drawn on the picture. ffmpeg
+    seeks each clip itself, samples only the frames the output rate needs, retimes video and audio, and encodes
+    in the same process. ``-readrate`` makes it produce the stream at the requested speed, so the viewer stays
+    near the live edge instead of buffering the whole window; ``control`` ends it the same way the MJPEG stream
+    ends (the pane's stop token).
+    """
+    end_s = match.start_s + match.frame_count / match.fps
+    duration_s = max(0.1, end_s - float(start_s))
+    pieces = _direct_pieces(match, start_s, duration_s)
+    resolved_audio = direct_audio_pieces(match.video, max(0.0, float(start_s)), duration_s) if audio else []
+    chosen = encoder or pick_encoder(codec)
+    # NVENC can consume CUDA frames directly, so the preferred path decodes, scales and encodes entirely on the
+    # GPU. A driver that cannot open the stream falls back to the copied-frame path before any byte is sent.
+    candidates = ["cuda", "auto"] if chosen.endswith("nvenc") else ["auto"]
+    last_error = "the direct encoder produced no output"
+    for hwaccel in candidates:
+        command = direct_encoder_command(
+            pieces,
+            display_fps=display_fps,
+            rate=rate,
+            width=width,
+            live=True,
+            encoder=chosen,
+            codec=codec,
+            source_fps=_direct_source_fps(match),
+            audio_pieces=resolved_audio,
+            pace=pace,
+            hwaccel=hwaccel,
+        )
+        process = _direct_process(command)
+        stderr = _StderrTail(process.stderr)
+        produced = 0
+        stopped = False
+        try:
+            while True:
+                if control is not None and control.stopped:
+                    stopped = True
+                    break
+                ready, _, _ = select.select([process.stdout], [], [], 0.5)
+                if not ready:
+                    if process.poll() is not None:
+                        break
+                    continue
+                chunk = os.read(process.stdout.fileno(), _CHUNK_BYTES)
+                if not chunk:
+                    break
+                produced += len(chunk)
+                yield chunk
+        finally:
+            with suppress(OSError, ValueError):
+                process.stdout.close()
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            stderr.close()
+        if produced or stopped or process.returncode == 0:
+            return
+        last_error = stderr.text() or last_error
+    raise VideoError(f"the direct encoder failed: {last_error}")
+
+
+def iter_direct_mjpeg_frames(
+    match,
+    *,
+    start_s: float,
+    width: int,
+    control=None,
+    pace: bool = True,
+    rate: float = 1.0,
+    display_fps: float = DIRECT_DISPLAY_FPS,
+):
+    """Yield JPEGs straight from ffmpeg's MJPEG encoder, one per sampled frame.
+
+    This is the MJPEG fallback's direct path: the server still wraps each picture in a multipart part, but the
+    decode, frame-rate sampling and JPEG encode all happen inside one ffmpeg process - Python only splits the
+    byte stream on the JPEG markers. ``-readrate`` paces the pictures at the requested speed.
+    """
+    end_s = match.start_s + match.frame_count / match.fps
+    duration_s = max(0.1, end_s - float(start_s))
+    pieces = _direct_pieces(match, start_s, duration_s)
+    command = direct_mjpeg_command(
+        pieces,
+        display_fps=display_fps,
+        rate=rate,
+        width=width,
+        source_fps=_direct_source_fps(match),
+        pace=pace,
+    )
+    process = _direct_process(command)
+    stderr = _StderrTail(process.stderr)
+    buffer = bytearray()
+    sent = 0
+    stopped = False
+    try:
+        while True:
+            if control is not None and control.stopped:
+                stopped = True
+                break
+            ready, _, _ = select.select([process.stdout], [], [], 0.5)
+            if not ready:
+                if process.poll() is not None:
+                    break
+                continue
+            chunk = os.read(process.stdout.fileno(), _CHUNK_BYTES)
+            if not chunk:
+                break
+            buffer.extend(chunk)
+            while True:
+                begin = buffer.find(b"\xff\xd8")
+                if begin < 0:
+                    # Keep a trailing 0xFF: it may be the first half of an SOI split across two reads.
+                    if buffer.endswith(b"\xff"):
+                        buffer[:] = b"\xff"
+                    else:
+                        buffer.clear()
+                    break
+                if begin:
+                    del buffer[:begin]
+                end = buffer.find(b"\xff\xd9", 2)
+                if end < 0:
+                    break  # the rest of this picture is still in the pipe
+                jpeg = bytes(buffer[: end + 2])
+                del buffer[: end + 2]
+                sent += 1
+                yield jpeg
+    finally:
+        with suppress(OSError, ValueError):
+            process.stdout.close()
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        stderr.close()
+    if sent == 0 and not stopped and process.returncode not in (0, None):
+        raise VideoError(f"the direct MJPEG encoder failed: {stderr.text()}")
+
+
 def _first_frame(reader):
     frames = reader.frames()
     first = next(frames, None)
@@ -399,24 +792,51 @@ def iter_live_chunks(
 ):
     """Yield the annotated match as a fragmented MP4, chunk by chunk, until the window ends or ``control`` stops.
 
-    A writer thread renders and feeds the encoder; this generator drains the encoder's output - and so paces
-    the pipeline: nothing is produced much faster than the client reads it, and the writer's own pacing keeps
-    the stream near real time (a decode that outruns the declared rate would otherwise run minutes ahead of
-    the viewer, buffered in the player). ``control`` is the MJPEG stream's ``StreamControl``, so ``/stop`` ends
-    both kinds of stream the same way.
+    With no overlay layers the whole picture is the recording itself, so the direct path takes over: ffmpeg
+    seeks the source clips, samples only the frames the output rate needs, keeps the soundtrack and encodes in
+    one process (see :func:`iter_direct_live_chunks`). With any layer on, a writer thread renders and feeds the
+    encoder as before; this generator drains the encoder's output - and so paces the pipeline: nothing is
+    produced much faster than the client reads it, and the writer's own pacing keeps the stream near real time.
+
+    ``fps`` is the source frames sampled a second. Above 1x it is reduced in step with ``rate`` so the output
+    timeline stays at :data:`DIRECT_DISPLAY_FPS` rather than growing to 120/240 fps at 4x/8x.
+    ``control`` is the MJPEG stream's ``StreamControl``, so ``/stop`` ends both kinds of stream the same way.
     """
+    if not any((overlays or {}).values()) and reader_factory is open_reader:
+        try:
+            as_source(match.video)
+        except (OSError, ValueError):
+            pass  # a missing source falls through to the reader, whose error message is the better one
+        else:
+            yield from iter_direct_live_chunks(
+                match,
+                start_s=start_s,
+                width=width,
+                control=control,
+                encoder=encoder,
+                pace=pace,
+                rate=rate,
+                audio=audio,
+                codec=codec,
+            )
+            return
     encoder = encoder or pick_encoder(codec)
+    sample_fps = float(fps)
+    if rate > 1.0:
+        # Only the frames a viewer can see reach the encoder: 2x still needs 30 source fps for 60 output, 8x
+        # needs 7.5. Leaving the old fps*rate arithmetic here would ask for 120 fps at 4x and 240 at 8x.
+        sample_fps = max(1.0, min(sample_fps, DIRECT_DISPLAY_FPS / float(rate)))
     end_s = match.start_s + match.frame_count / match.fps
     stop = control if control is not None else _NEVER_STOPPED
     reader = reader_factory(
-        match.video, fps=fps, width=width, start_s=start_s, duration_s=max(0.1, end_s - start_s)
+        match.video, fps=sample_fps, width=width, start_s=start_s, duration_s=max(0.1, end_s - start_s)
     )
     first, rest = _first_frame(reader)
     _timestamp, frame = first
     height, actual_width = frame.shape[:2]
     process = _start(
         encoder,
-        fps=fps,
+        fps=sample_fps,
         width=actual_width,
         height=height,
         output="pipe:1",
@@ -430,7 +850,7 @@ def iter_live_chunks(
     failures: list[Exception] = []
 
     def produce() -> None:
-        period = 1.0 / max(0.01, fps * max(0.01, rate))  # the muxer's clock runs fps*rate per source second
+        period = 1.0 / max(0.01, sample_fps * max(0.01, rate))  # the muxer's clock runs fps*rate per source second
         next_frame_at = time.monotonic()
         try:
             for timestamp, frame in _chain(first, rest):
