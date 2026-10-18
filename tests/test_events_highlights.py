@@ -23,6 +23,8 @@ from soccer_analytics.analysis.events import (
 )
 from soccer_analytics.analysis import highlights as highlights_lib
 from soccer_analytics.analysis.highlights import (
+    BUILD_UP_LEAD_S,
+    BUILD_UP_TAIL_S,
     LEAD_S,
     PREVIEW_SETTINGS,
     TAIL_S,
@@ -382,8 +384,12 @@ def test_discarding_auto_detected_events_keeps_the_manual_tags() -> None:
 def test_moment_for_event_shapes_one_window_around_the_tag() -> None:
     event = Event(time_s=42.0, type="goal", team=1, note="header")
     moment = moment_for_event(event)
-    assert moment.start_s == pytest.approx(42.0 - LEAD_S)
-    assert moment.end_s == pytest.approx(42.0 + TAIL_S)
+    # A goal carries the build-up: nine seconds before, six after.
+    assert moment.start_s == pytest.approx(42.0 - BUILD_UP_LEAD_S)
+    assert moment.end_s == pytest.approx(42.0 + BUILD_UP_TAIL_S)
+    save = moment_for_event(Event(time_s=42.0, type="save", team=0))
+    assert save.start_s == pytest.approx(42.0 - BUILD_UP_LEAD_S)
+    assert save.end_s == pytest.approx(42.0 + BUILD_UP_TAIL_S)
     assert moment.time_s == pytest.approx(42.0)
     assert moment.event_type == "goal" and moment.team == 1
     assert "header" in moment.reason
@@ -394,18 +400,20 @@ def test_moment_for_event_shapes_one_window_around_the_tag() -> None:
     assert moment_for_event(Event(time_s=1.0, type="shot")).start_s == 0.0
 
 
-def test_a_detected_whistle_is_clipped_like_any_other_moment() -> None:
-    """Ten seconds, the blast four seconds in. The window is the same for every source.
+def test_a_detected_whistle_keeps_the_short_review_window() -> None:
+    """A whistle review stays ten seconds, the blast four seconds in; goals and saves get the build-up window.
 
     Speed for a review comes from the preview *mode* instead (`PREVIEW_SETTINGS`): a longer window made every clip
     bigger without answering the question the review asks, which is only whether the sound is a whistle.
     """
     detected = moment_for_event(Event(time_s=100.0, type="other", source="audio", note="whistle"))
     tagged = moment_for_event(Event(time_s=100.0, type="goal", team=0))
-    for moment in (detected, tagged):
-        assert moment.start_s == pytest.approx(100.0 - LEAD_S)
-        assert moment.end_s == pytest.approx(100.0 + TAIL_S)
+    assert detected.start_s == pytest.approx(100.0 - LEAD_S)
+    assert detected.end_s == pytest.approx(100.0 + TAIL_S)
     assert detected.end_s - detected.start_s == pytest.approx(10.0)
+    assert tagged.start_s == pytest.approx(100.0 - BUILD_UP_LEAD_S)
+    assert tagged.end_s == pytest.approx(100.0 + BUILD_UP_TAIL_S)
+    assert tagged.end_s - tagged.start_s == pytest.approx(15.0)
     # The reel cuts the same seconds as the preview.
     assert build_moments([Event(time_s=100.0, type="other", source="audio")])[0].end_s == detected.end_s
 
@@ -673,10 +681,10 @@ def test_export_moment_writes_a_playable_preview(tmp_path: Path) -> None:
     frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
     out_fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
     capture.release()
-    # The preview is the moment's own window (~10 s), not the whole 30 s source. The export normalizes the rate to
-    # 30 fps, so measure the duration rather than the frame count.
+    # The preview is the moment's own 15 s goal window, not the whole 30 s source. The export normalizes the rate
+    # to 30 fps, so measure the duration rather than the frame count.
     duration_s = frames / out_fps
-    assert 4.0 < duration_s <= 12.0, f"preview is not the moment window ({duration_s:.1f}s)"
+    assert 14.0 < duration_s <= 16.0, f"preview is not the moment window ({duration_s:.1f}s)"
 
 
 def test_a_preview_is_cut_from_the_recording_the_candidate_was_found_in(tmp_path: Path) -> None:

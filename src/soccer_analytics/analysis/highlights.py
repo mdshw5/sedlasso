@@ -41,6 +41,12 @@ AUDIO_WEIGHT = 1.0
 MOMENTUM_WEIGHT = 4.0
 LEAD_S = 4.0  # start a little before the moment so the build-up is included
 TAIL_S = 6.0
+# A goal or save is worth the move that produced it, not the walk back from the net: place the event nine
+# seconds into the clip and leave six seconds of aftermath. The 15 s window matches MIN_CLIP_S, so the exported
+# clip is exactly this window rather than the old 4 s before / 11 s after that padding produced.
+BUILD_UP_EVENT_TYPES = {"goal", "penalty", "save"}
+BUILD_UP_LEAD_S = 9.0
+BUILD_UP_TAIL_S = 6.0
 # Exported reels are not previews: they keep the source's own resolution and frame rate and use a visually
 # near-lossless encode. Previews stay on the cheap/fast settings above. CRF 18 (x264) and CQ 18 (NVENC) are
 # close enough to the camera original that the reel is not the thing that softens a 4K60 recording.
@@ -106,10 +112,15 @@ def moment_for_event(event: Event) -> Moment:
         weight *= 1.3
     elif event.type in ("clearance", "tackle"):
         weight *= 1.2
+    lead, tail = (
+        (BUILD_UP_LEAD_S, BUILD_UP_TAIL_S)
+        if event.type in BUILD_UP_EVENT_TYPES
+        else (LEAD_S, TAIL_S)
+    )
     return Moment(
         time_s=event.time_s,
-        start_s=max(0.0, event.time_s - LEAD_S),
-        end_s=event.time_s + TAIL_S,
+        start_s=max(0.0, event.time_s - lead),
+        end_s=event.time_s + tail,
         weight=weight,
         reason=f"{event.type} ({event.source})" + (f": {event.note}" if event.note else ""),
         event_type=event.type,
