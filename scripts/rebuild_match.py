@@ -92,7 +92,8 @@ def main() -> int:
     print(f"tracked {len(report.players)} players ({time.time() - started:.0f}s)", flush=True)
 
     roles, attack = roles_and_attack(
-        report, detections, assignment, segment=segment, pitch_length_m=record.pitch_length_m
+        report, detections, assignment, segment=segment, pitch_length_m=record.pitch_length_m,
+        swap_attack=bool(record.swap_attack),
     )
     replay = build_replay(
         (record.pitch_length_m, record.pitch_width_m),

@@ -1702,7 +1702,16 @@
           emptyNote.textContent = `Could not load the replay (${response.status}). Rebuild it in Step 3.`;
           return;
         }
+        const previous = state.data;
+        const previousTime = state.time;
+        const previousAttack = previous ? JSON.stringify(previous.attack || null) : null;
         state.data = await response.json();
+        // Swapping the measured ends rewrites the replay's attack directions, and its content-hashed URL makes
+        // the browser fetch the new payload. The pitch arrows redraw from it; the footage pane's scoreboard is
+        // drawn server-side, so it has to be re-opened to show the same ends. Keep the viewer's place rather
+        // than resetting a correction that is only about which way the arrows point.
+        const attackChanged =
+          previous !== null && JSON.stringify(state.data.attack || null) !== previousAttack;
         state.index = [];
         state.data.players.forEach((player, i) => {
           player.index_in_list = i;
@@ -1712,7 +1721,7 @@
           });
           state.index.push({byFrame});
         });
-        state.time = 0;
+        state.time = attackChanged ? Math.min(previousTime, state.data.duration_s) : 0;
         scrub.max = String(state.data.duration_s);
         emptyNote.style.display = 'none';
         renderLegend();
@@ -1723,6 +1732,8 @@
           state.pendingSeek = null;
           draw();
           setPlaying(true);
+          restartFootage();
+        } else if (attackChanged) {
           restartFootage();
         }
       }

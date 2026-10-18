@@ -435,6 +435,17 @@ class EventLog:
         self.events = kept
         return removed
 
+    def remove(self, index: int) -> Event:
+        """Drop the event at ``index`` and return it; raises :class:`IndexError` for an unknown row.
+
+        Removal is by position because the page's pickers index into this same list. It is deliberately a hard
+        delete of one row - unlike :meth:`discard_detected` and :meth:`discard_false`, which are bulk review
+        sweeps that keep a human's own tags.
+        """
+        if not 0 <= int(index) < len(self.events):
+            raise IndexError(f"no event at index {index} of {len(self.events)}")
+        return self.events.pop(int(index))
+
     def set_verdict(self, index: int, verdict: str) -> Event:
         """Record the review verdict for the event at ``index`` and return it.
 

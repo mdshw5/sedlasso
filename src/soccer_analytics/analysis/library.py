@@ -40,6 +40,9 @@ ANALYSIS_DIRNAME = "analysis"  # the folder each analyzed video's match director
 SEGMENTS_DIRNAME = "segments"  # Stage A results, inside the match directory
 AUDIO_DIRNAME = "audio"  # the recording's audio as wav (the whistle scan's cache), inside the match directory
 GAME_MANIFEST_FILENAME = "game.json"  # a game's clip manifest; the manifest itself is the analyzed source
+# The replay's per-half attack directions, written beside the (tens-of-megabytes) replay payload so the stream
+# server can notice a swap correction with a stat and a tiny read instead of parsing the whole replay again.
+REPLAY_ATTACK_FILENAME = "attack.json"
 LEGACY_MATCHES_ROOT = REPO_ROOT / "data" / "matches"  # where archives lived before the move beside the footage
 MATCHES_ROOT = LEGACY_MATCHES_ROOT  # kept for callers that still name the old root
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -237,6 +240,10 @@ class MatchRecord:
     format: str = "11v11"
     created: float = field(default_factory=time.time)
     team_names: list[str] = field(default_factory=lambda: ["Team A", "Team B"])
+    # Some footage makes the measured ends ambiguous (or the team clustering swaps sides). This inverts every
+    # half's attack direction without a recalibration: the pitch arrows and the event table's aim follow it, and
+    # a re-run detector / rebuild uses the swapped sides for clearances and shots.
+    swap_attack: bool = False
     # The saved team roster (analysis.rosters) each team's player names come from, by team index; "" = none
     # linked. Only the *link* lives in the match - the names stay in the roster library, so fixing a roster
     # updates every match that links it, including already-analyzed ones.
@@ -439,17 +446,41 @@ class MatchLibrary:
         return clicks
 
     def load_clicks_source(self, match_id: str) -> str | None:
-        """The recording the saved clicks were made on, when the archive recorded it.
+        """The recording the saved clicks were made on, re-pointed if the archive has moved.
 
         Legacy archives have no source and return ``None``. The dashboard then falls back to the old behavior
         (restore against whichever video is open), because refusing an unlabelled set would silently discard the
         only copy of a pre-upgrade calibration.
+
+        A stored absolute path can outlive the mount it was written on when the footage directory moves (the
+        real archive moved from ``/srv/storage/<date>`` to ``/srv/storage/home_video/Xbot/<date>``). A missing
+        ``game.json`` is re-pointed at this match's own manifest when the analysis-directory name matches, and a
+        missing recording is matched by name against the record's resolved sources. Without this, a moved
+        archive looks like a different recording and the (still valid) calibration is refused.
         """
         path = self.path(match_id) / "clicks.json"
         if not path.exists():
             return None
         source = json.loads(path.read_text()).get("source")
-        return str(source) if source else None
+        if not source:
+            return None
+        stored = str(source)
+        if Path(stored).exists():
+            return stored
+        directory = self.path(match_id)
+        local_manifest = directory / GAME_MANIFEST_FILENAME
+        if Path(stored).name == GAME_MANIFEST_FILENAME and local_manifest.exists():
+            if Path(stored).parent.name == directory.name:
+                return str(local_manifest)
+        try:
+            record = self.load(match_id)
+        except (OSError, json.JSONDecodeError):
+            record = None
+        if record is not None:
+            for candidate in record.sources:
+                if Path(candidate).name == Path(stored).name and Path(candidate).exists():
+                    return str(candidate)
+        return resolve_path(stored, directory.parent.parent)
 
     def load_clicks_pitch(self, match_id: str) -> tuple[float, float] | None:
         """The pitch dimensions the saved clicks were labelled against, or ``None`` for a legacy set.
@@ -483,6 +514,9 @@ class MatchLibrary:
         of JSON that every view of the match would download. The centered-clip cutter reads them from here.
         """
         path = self.path(match_id) / "replay.json"
+        # The directions are a few dozen bytes inside a payload of tens of megabytes. The stream server watches
+        # this sidecar to pick up a swap correction without re-reading (or re-parsing) the whole replay.
+        _atomic_write(self.path(match_id) / REPLAY_ATTACK_FILENAME, {"attack": payload.get("attack")})
         _atomic_write(path, payload)
         if boxes is not None:
             np.savez_compressed(self.path(match_id) / "boxes.npz", **boxes)

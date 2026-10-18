@@ -282,6 +282,7 @@ def team_orientations(
     pitch_length_m: float,
     *,
     half_bounds: tuple[float, float, float] | None = None,
+    swap: bool = False,
 ) -> list[HalfOrientation]:
     """Which goal each team defends, per half, from where its players spend the half.
 
@@ -291,7 +292,8 @@ def team_orientations(
 
     ``half_bounds`` is the game clock's ``(kick-off, half-time, full-time)`` in source seconds. Without it the whole
     match is treated as one period (half 0), which is right for a single-half segment and honest for a match whose
-    halves were not marked - the sides are then the match's own, not a half's.
+    halves were not marked - the sides are then the match's own, not a half's. ``swap`` inverts every measured
+    side and direction: some footage makes the ends ambiguous, and the user can correct that without recalibrating.
     """
     if half_bounds is None:
         periods = [(0, -np.inf, np.inf)]
@@ -320,6 +322,9 @@ def team_orientations(
                 defends_left = team == left_team
                 defending[team] = "left" if defends_left else "right"
                 attack[team] = 1 if defends_left else -1  # attacks the far end from the one it defends
+        if swap and defending:
+            defending = {team: ("right" if side == "left" else "left") for team, side in defending.items()}
+            attack = {team: -direction for team, direction in attack.items()}
         out.append(HalfOrientation(half_number, defending, attack, mean_x))
     return out
 
@@ -521,6 +526,7 @@ def detect_events(
     whistles: list[float] | None = None,
     numbers: dict[int, dict] | None = None,
     half_bounds: tuple[float, float, float] | None = None,
+    swap_attack: bool = False,
     video: str = "",
 ) -> list[Event]:
     """Infer goals, shots, corners, penalties, clearances and tackles from the ball and player tracks.
@@ -528,8 +534,8 @@ def detect_events(
     ``ball_xy``/``ball_measured`` are the ``(F, 2)`` and ``(F,)`` arrays ``projection.project_ball_track`` returns;
     ``times`` is the source seconds of each frame. ``players`` are Stage B's tracks, ``pitch`` is ``(length, width)``
     in meters, ``whistles`` are the audio scan's candidate times (used only to tell a penalty from a free kick),
-    ``numbers`` maps a track id to its shirt number/name, and ``half_bounds`` is the game clock's
-    ``(kick-off, half-time, full-time)``.
+    ``numbers`` maps a track id to its shirt number/name, ``half_bounds`` is the game clock's
+    ``(kick-off, half-time, full-time)``, and ``swap_attack`` inverts the measured ends (the match setting).
 
     Returns events with ``source="ball"``, sorted by time. Every event carries a note saying what was measured, and
     the player it is attributed to when one is near enough to the ball to be named.
@@ -537,7 +543,7 @@ def detect_events(
     length_m, width_m = float(pitch[0]), float(pitch[1])
     motion = ball_motion(ball_xy, ball_measured, times, pitch=(length_m, width_m))
     by_frame = _players_by_frame(players)
-    orientations = team_orientations(players, length_m, half_bounds=half_bounds)
+    orientations = team_orientations(players, length_m, half_bounds=half_bounds, swap=swap_attack)
     whistle_times = sorted(float(w) for w in (whistles or []))
 
     events: list[Event] = []

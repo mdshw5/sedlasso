@@ -1,0 +1,6 @@
+- [x] Add an option to swap attacking and defending teams if auto detection doesn't get it correct
+- [x] Add functionality to edit (remove) individual tagged events
+- [x] Add small arrows to indicate attacking directions in scoreboard
+- [x] Add a small yellow whistle indicator in the scoreboard
+- [x] Add an indicator for half 1 / half 2 in the scoreboard
+- [x] Add an option to export saves in the highlight reels section

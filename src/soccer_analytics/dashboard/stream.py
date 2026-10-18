@@ -43,7 +43,12 @@ import numpy as np
 from soccer_analytics.analysis import game as game_lib
 from soccer_analytics.analysis.events import VERDICT_FALSE
 from soccer_analytics.analysis.identity import numbers_are_stale
-from soccer_analytics.analysis.library import MatchLibrary, MatchRecord, resolve_path
+from soccer_analytics.analysis.library import (
+    REPLAY_ATTACK_FILENAME,
+    MatchLibrary,
+    MatchRecord,
+    resolve_path,
+)
 from soccer_analytics.analysis.projection import segment_poses
 from soccer_analytics.analysis.rosters import RosterLibrary, team_rosters_for
 from soccer_analytics.analysis.stage_a import load_segment
@@ -197,6 +202,15 @@ OTHER_BGR = (150, 150, 150)
 # colors so the two views name the same person the same way. BGR order, unlike the pane's hex.
 ROLE_BGR = {"referee": (247, 85, 168), "goalkeeper": (11, 158, 245)}  # #a855f7, #f59e0b
 PITCH_BGR = (0, 200, 255)
+# A yellow whistle in the scoreboard while an audio-detected whistle is close to the frame. BGR, like every
+# other drawing colour here.
+WHISTLE_BGR = (0, 215, 255)
+WHISTLE_WINDOW_S = 2.0
+# The camera burns its own wall clock into the lower-left corner. The scoreboard sits there now, so an opaque
+# patch - fractions of the frame's width/height, ``(x0, y0, x1, y1)`` - hides that clock instead of letting it
+# show through the translucent panel or sit beside the match clock. The panel uses the same colour.
+BURNED_TIMER_BOX = (0.0, 0.945, 0.08, 1.0)
+SCOREBOARD_BGR = (24, 24, 24)
 INK = (30, 30, 30)
 PAPER = (245, 245, 245)
 
@@ -435,6 +449,10 @@ class AnnotatedMatch:
         ball_records: list[dict],
         teams: list[TeamStyle],
         notes: list[str],
+        attack: dict | None = None,
+        attack_path: str | Path | None = None,
+        whistle_times: list[float] | None = None,
+        half_source_s: float | None = None,
         goals: list[tuple[float, int]] | None = None,
     ):
         self.match_id = match_id
@@ -491,6 +509,55 @@ class AnnotatedMatch:
         # (game-clock second, team) for confirmed goals. The scoreboard counts these; an empty list is an honest
         # 0-0, not an error - most matches have no confirmed goal event at all.
         self.goals = sorted(goals or [])
+        # The replay's per-period attack directions (already carrying the user's swap correction), the whistle
+        # candidates on the source clock, and the game's half-time mark. The export scoreboard uses all three.
+        self.attack = attack if isinstance(attack, dict) else {}
+        # The swap correction edits the replay in place from the dashboard. Re-reading the whole replay to pick
+        # that up would parse tens of megabytes on a running stream, so the directions also live in a tiny
+        # sidecar that :meth:`refresh_attack_if_changed` polls between frames.
+        self.attack_path = Path(attack_path) if attack_path is not None else None
+        self._attack_mtime = self._attack_file_mtime()
+        self._attack_checked_at = 0.0
+        self.whistles = sorted(float(value) for value in (whistle_times or []))
+        self.half_source_s = None if half_source_s is None else float(half_source_s)
+
+    def _attack_file_mtime(self) -> int | None:
+        """The sidecar's modification stamp, or ``None`` when the match predates it (or it is unreadable)."""
+        if self.attack_path is None:
+            return None
+        try:
+            return self.attack_path.stat().st_mtime_ns
+        except OSError:
+            return None
+
+    def refresh_attack(self, attack: dict | None, *, mtime: int | None = None) -> None:
+        """Point the scoreboard at freshly saved directions; called when the swap setting edits them in place."""
+        self.attack = attack if isinstance(attack, dict) else {}
+        if mtime is not None:
+            self._attack_mtime = int(mtime)
+
+    def refresh_attack_if_changed(self, *, interval_s: float = 0.5, force: bool = False) -> None:
+        """Re-read the small attack sidecar when the dashboard swapped the measured ends.
+
+        A running scoreboard must not keep pointing teams at the ends the user just corrected. The sidecar is
+        tiny, so this is a stat per request (``force``) and at most one every ``interval_s`` per streaming
+        thread - never a parse of the full replay. A missing sidecar leaves the replay's own directions alone.
+        """
+        if self.attack_path is None:
+            return
+        now = time.monotonic()
+        if not force and now - self._attack_checked_at < interval_s:
+            return
+        self._attack_checked_at = now
+        mtime = self._attack_file_mtime()
+        if mtime is None or mtime == self._attack_mtime:
+            return
+        try:
+            payload = json.loads(self.attack_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return
+        attack = payload.get("attack") if isinstance(payload, dict) else None
+        self.refresh_attack(attack, mtime=mtime)
 
     def refresh_numbers(self, numbers: dict[int, dict], numbers_note: str | None) -> None:
         """Rebuild the label chips and the numbers note from a fresh assignment (both are edited live).
@@ -568,6 +635,18 @@ class AnnotatedMatch:
             team_rosters=team_rosters_for(RosterLibrary(), record.team_rosters),
         )
 
+        # A sidecar written by a swap correction wins over the replay's copy: it is the newest directions and the
+        # reason the stream can refresh them without re-reading the replay.
+        attack_path = match_dir / REPLAY_ATTACK_FILENAME
+        attack = replay.get("attack")
+        if attack_path.exists():
+            try:
+                sidecar = json.loads(attack_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                pass
+            else:
+                attack = sidecar.get("attack") if isinstance(sidecar, dict) else None
+
         ball_records: list[dict] = []
         try:
             ball_records = json.loads((segment_dir / BALL_TRACK_FILE).read_text()).get("frames") or []
@@ -575,12 +654,35 @@ class AnnotatedMatch:
             pass
 
         goals: list[tuple[float, int]] = []
+        whistles: list[float] = []
+        event_game = None
+        manifest_path = match_dir / game_lib.MANIFEST_FILE
+        if manifest_path.exists():
+            try:
+                event_game = game_lib.GameRecord.load(match_dir)
+            except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+                event_game = None
+        event_source = str(manifest_path) if manifest_path.exists() else str(segment.meta.get("video") or "")
         try:
             for event in library.events(match_id).events:
                 if event.type == "goal" and event.verdict != VERDICT_FALSE and event.team in (0, 1):
                     goals.append((float(event.time_s), int(event.team)))
+                if event.source == "audio":
+                    # A whistle candidate's time is on its own recording. Put it on the source clock so the
+                    # scoreboard's indicator matches the frames the stream is drawing.
+                    at = float(event.time_s)
+                    if (
+                        event.video
+                        and event_game is not None
+                        and Path(event.video).resolve() != Path(event_source).resolve()
+                    ):
+                        on_game = game_lib.game_time(event_game, at, event.video)
+                        if on_game is not None:
+                            at = float(on_game)
+                    whistles.append(at)
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
             goals = []
+            whistles = []
 
         notes: list[str] = []
         excluded = int(replay.get("bystanders_excluded") or 0)
@@ -643,6 +745,14 @@ class AnnotatedMatch:
             ball_records=ball_records,
             teams=teams,
             notes=notes,
+            attack=attack,
+            attack_path=attack_path,
+            whistle_times=whistles,
+            half_source_s=(
+                float(event_game.bounds()[1])
+                if event_game is not None and event_game.bounds() is not None
+                else None
+            ),
             goals=goals,
         )
 
@@ -661,6 +771,36 @@ class AnnotatedMatch:
             if time_s <= at:
                 score[team] += 1
         return score[0], score[1]
+
+    def attack_directions(self, index: int) -> list[int]:
+        """The ``[team0, team1]`` attack vectors for the period containing ``index``; [] when unmeasured."""
+        directions = self.attack.get("directions") or []
+        if not directions:
+            return []
+        half_frame = self.attack.get("half_frame")
+        period = 1 if half_frame is not None and int(index) >= int(half_frame) else 0
+        pair = directions[min(period, len(directions) - 1)]
+        if not isinstance(pair, (list, tuple)):
+            return []
+        return [int(direction) if direction else 0 for direction in pair]
+
+    def half_label(self, index: int) -> str:
+        """``"1H"``/``"2H"`` for the scoreboard, or "" when the match has no usable half mark."""
+        half_s = self.half_source_s
+        if half_s is None:
+            half_frame = self.attack.get("half_frame")
+            if half_frame is None:
+                return ""
+        else:
+            # Compare frame numbers, not clock seconds: the half mark almost never falls exactly on a frame, and
+            # a seconds comparison showed 1H for the one frame at the mark before flipping to 2H.
+            half_frame = int(round((float(half_s) - self.start_s) * self.fps))
+        return "1H" if int(index) < int(half_frame) else "2H"
+
+    def whistle_active(self, index: int) -> bool:
+        """Whether an audio-detected whistle is close enough to light the scoreboard indicator."""
+        at = self.source_time(index)
+        return any(abs(at - whistle) <= WHISTLE_WINDOW_S for whistle in self.whistles)
 
     def index_for(self, start_s: float) -> int:
         """The first analysis frame at or after a source-clock time, clamped to the analyzed window."""
@@ -765,6 +905,7 @@ class AnnotatedMatch:
         if ball:
             self._draw_ball(frame, index)
         if scoreboard:
+            self.refresh_attack_if_changed()
             self._draw_scoreboard(frame, index)
         if hud:
             self._draw_hud(frame, index, note=note, session_line=debug)
@@ -807,6 +948,7 @@ class AnnotatedMatch:
         if ball:
             self._draw_ball(frame, earlier, stamp=self.ball_at(position))
         if scoreboard:
+            self.refresh_attack_if_changed()
             self._draw_scoreboard(frame, earlier)
         if hud:
             self._draw_hud(frame, earlier, note=note, session_line=debug)
@@ -965,71 +1107,176 @@ class AnnotatedMatch:
         _outline_text(frame, line, (width - pad - tw, pad + int(18 * scale)), PAPER, font)
 
     def _draw_scoreboard(self, frame: np.ndarray, index: int) -> None:
-        """A top-centre scoreboard: team names, confirmed score and the match clock.
+        """A lower-left scoreboard: teams and scores stacked, with the clock column on their right.
 
         The score counts the match's confirmed goal events (manual tags and detected goals a reviewer has not
         rejected). With no such events it honestly reads 0-0; the scoreboard does not infer goals from the
-        ball scan.
+        ball scan. Stacking the two teams keeps the panel narrow: each row carries a swatch (with the measured
+        attack direction, the user's swap setting included), the team name and its score, while the half,
+        clock and whistle indicator share a column to their right. A small yellow whistle lights beside the
+        clock while an audio-detected whistle is within a couple of seconds.
         """
-        height, width = frame.shape[:2]
+        self._cover_burned_timer(frame)
+        height = frame.shape[0]
         scale = height / 1080.0
         name_font = max(0.45, 0.62 * scale)
         clock_font = max(0.35, 0.45 * scale)
         names = [style.name for style in self.teams]
         while len(names) < 2:
             names.append(f"Team {len(names) + 1}")
+        names = names[:2]
         score = self.score_at(index)
-        line = f"{names[0]}   {score[0]} - {score[1]}   {names[1]}"
-        (line_w, line_h), _ = cv2.getTextSize(line, FONT, name_font, 2)
+
+        pad = max(8, int(14 * scale))
+        gap = max(4, int(6 * scale))
+        row_gap = max(2, int(4 * scale))
+        swatch = max(12, int(20 * scale))
+        whistle_r = max(7, int(9 * scale))
+        name_sizes = [cv2.getTextSize(name, FONT, name_font, 2) for name in names]
+        row_h = max(swatch, max(size[0][1] for size in name_sizes))
+        name_w = max(size[0][0] for size in name_sizes)
+        score_w = max(cv2.getTextSize(text, FONT, name_font, 2)[0][0] for text in ("0", "00"))
+        row_step = row_h + row_gap
+
         clock = max(0.0, self.source_time(index) - self.start_s)
         clock_text = f"{int(clock) // 60}:{int(clock) % 60:02d}"
+        half = self.half_label(index)
+        if half:
+            clock_text = f"{half}  {clock_text}"
         (clock_w, clock_h), _ = cv2.getTextSize(clock_text, FONT, clock_font, 1)
-        pad = max(8, int(14 * scale))
-        swatch = max(10, int(18 * scale))
-        panel_w = max(line_w + 4 * pad + 2 * swatch, clock_w + 2 * pad)
-        panel_h = 3 * pad + line_h + clock_h
-        x0 = max(0, (width - panel_w) // 2)
-        y0 = pad
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (x0, y0), (x0 + panel_w, y0 + panel_h), (24, 24, 24), -1)
-        cv2.addWeighted(overlay, 0.68, frame, 0.32, 0, frame)
-        left_colour = self.teams[0].bgr if self.teams else FALLBACK_BGR[0]
-        right_colour = self.teams[1].bgr if len(self.teams) > 1 else FALLBACK_BGR[1]
-        cv2.rectangle(frame, (x0 + pad, y0 + pad), (x0 + pad + swatch, y0 + pad + line_h), left_colour, -1)
-        cv2.rectangle(
+        # The whistle's drawing reaches from ``cx - r`` to ``cx + 1.5r``, so reserve 2.5r for it.
+        whistle_w = int(round(2.5 * whistle_r)) + 1
+        right_w = clock_w + gap + whistle_w
+        divider_gap = max(6, int(10 * scale))
+
+        swatch_x = pad  # x0 is 0: the panel is flush with the left edge
+        name_x = swatch_x + swatch + gap
+        score_right = name_x + name_w + gap + score_w
+        divider_x = score_right + divider_gap
+        right_x = divider_x + divider_gap
+        panel_w = min(right_x + right_w + pad, frame.shape[1])
+        panel_h = max(2 * pad + 2 * row_h + row_gap, 2 * pad + max(clock_h, 2 * whistle_r))
+        # Flush to the lower-left corner, like a broadcast lower-third: the panel and the opaque timer patch
+        # read as one block there, instead of a floating box that would leave the burned-in clock peeking out.
+        x0 = 0
+        y0 = height - panel_h
+        # Opaque, because the same lower-left corner holds the camera's burned-in wall clock: a translucent
+        # panel would let that clock show through beside the match clock. The timer patch is the same colour,
+        # so the panel and the patch read as one block.
+        cv2.rectangle(frame, (x0, y0), (x0 + panel_w, y0 + panel_h), SCOREBOARD_BGR, -1)
+        cv2.line(
             frame,
-            (x0 + panel_w - pad - swatch, y0 + pad),
-            (x0 + panel_w - pad, y0 + pad + line_h),
-            right_colour,
-            -1,
-        )
-        cv2.putText(
-            frame,
-            line,
-            (x0 + 2 * pad + swatch, y0 + pad + line_h),
-            FONT,
-            name_font,
-            PAPER,
-            2,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            frame,
-            clock_text,
-            (x0 + (panel_w - clock_w) // 2, y0 + 2 * pad + line_h + clock_h),
-            FONT,
-            clock_font,
-            PAPER,
+            (divider_x, y0 + pad),
+            (divider_x, y0 + panel_h - pad),
+            (85, 85, 85),
             1,
             cv2.LINE_AA,
         )
 
+        directions = self.attack_directions(index)
+        for team in (0, 1):
+            colour = self.teams[team].bgr if team < len(self.teams) else FALLBACK_BGR[team]
+            row_top = y0 + pad + team * row_step
+            swatch_top = row_top + (row_h - swatch) // 2
+            cv2.rectangle(
+                frame,
+                (swatch_x, swatch_top),
+                (swatch_x + swatch, swatch_top + swatch),
+                colour,
+                -1,
+            )
+            direction = directions[team] if team < len(directions) else 0
+            if direction:
+                centre_x = swatch_x + swatch // 2
+                centre_y = swatch_top + swatch // 2
+                half_size = max(3, swatch // 4)
+                points = (
+                    [
+                        (centre_x - half_size, centre_y - half_size),
+                        (centre_x + half_size, centre_y),
+                        (centre_x - half_size, centre_y + half_size),
+                    ]
+                    if direction > 0
+                    else [
+                        (centre_x + half_size, centre_y - half_size),
+                        (centre_x - half_size, centre_y),
+                        (centre_x + half_size, centre_y + half_size),
+                    ]
+                )
+                cv2.fillPoly(frame, [np.array(points, dtype=np.int32)], _text_bgr(colour))
+            text_top = row_top + (row_h - name_sizes[team][0][1]) // 2
+            cv2.putText(
+                frame,
+                names[team],
+                (name_x, text_top + name_sizes[team][0][1]),
+                FONT,
+                name_font,
+                PAPER,
+                2,
+                cv2.LINE_AA,
+            )
+            score_text = str(score[team])
+            (score_text_w, score_text_h), _ = cv2.getTextSize(score_text, FONT, name_font, 2)
+            cv2.putText(
+                frame,
+                score_text,
+                (score_right - score_text_w, row_top + (row_h + score_text_h) // 2),
+                FONT,
+                name_font,
+                PAPER,
+                2,
+                cv2.LINE_AA,
+            )
+
+        clock_y = y0 + (panel_h + clock_h) // 2
+        cv2.putText(frame, clock_text, (right_x, clock_y), FONT, clock_font, PAPER, 1, cv2.LINE_AA)
+        whistle_cx = x0 + panel_w - pad - int(round(1.5 * whistle_r))
+        whistle_cy = y0 + panel_h // 2
+        self._draw_whistle(frame, whistle_cx, whistle_cy, whistle_r, active=self.whistle_active(index))
+
+    @staticmethod
+    def _cover_burned_timer(frame: np.ndarray) -> None:
+        """Hide the camera's own wall clock under an opaque patch in the lower-left corner."""
+        height, width = frame.shape[:2]
+        x0, y0, x1, y1 = BURNED_TIMER_BOX
+        left = max(0, int(round(x0 * width)))
+        top = max(0, int(round(y0 * height)))
+        right = max(left, min(width - 1, int(round(x1 * width)) - 1))
+        bottom = max(top, min(height - 1, int(round(y1 * height)) - 1))
+        cv2.rectangle(frame, (left, top), (right, bottom), SCOREBOARD_BGR, -1)
+
+    @staticmethod
+    def _draw_whistle(frame: np.ndarray, cx: int, cy: int, radius: int, *, active: bool) -> None:
+        """A tiny whistle: a coloured body with a mouthpiece and a dark hole; yellow while it is sounding."""
+        colour = WHISTLE_BGR if active else (105, 105, 105)
+        outline = (20, 20, 20)
+        thickness = max(1, radius // 5)
+        cv2.circle(frame, (cx, cy), radius, colour, -1)
+        cv2.circle(frame, (cx, cy), radius, outline, thickness)
+        cv2.rectangle(
+            frame,
+            (cx + radius // 2, cy - radius // 3),
+            (cx + radius + radius // 2, cy + radius // 3),
+            colour,
+            -1,
+        )
+        cv2.rectangle(
+            frame,
+            (cx + radius // 2, cy - radius // 3),
+            (cx + radius + radius // 2, cy + radius // 3),
+            outline,
+            max(1, thickness // 2),
+        )
+        cv2.circle(frame, (cx - radius // 3, cy - radius // 4), max(2, radius // 3), outline, -1)
+
     def _draw_debug(self, frame: np.ndarray, index: int) -> None:
         """The diagnosing corners: which session this is (top-left), where in the analysis this frame sits
-        (top-right, under the clock) and the honest notes about what was left out (bottom-left)."""
+        (top-right, under the clock) and the honest notes about what was left out (bottom-right, so they do not
+        overwrite the lower-left scoreboard)."""
         height, width = frame.shape[:2]
         scale = height / 1080.0
         font = max(0.4, 0.55 * scale)
+        note_font = max(0.35, 0.42 * scale)
         pad = max(6, int(12 * scale))
         _outline_text(frame, self.match_id, (pad, pad + int(18 * scale)), PAPER, font)
         counter = f"frame {index}/{self.frame_count}"
@@ -1037,7 +1284,8 @@ class AnnotatedMatch:
         _outline_text(frame, counter, (width - pad - tw, pad + int(18 * scale) + int(21 * scale)), PAPER, font)
         y = height - pad
         for line in reversed(self.notes[-3:]):
-            _outline_text(frame, line, (pad, y), PAPER, max(0.35, 0.42 * scale))
+            (tw, _th), _ = cv2.getTextSize(line, FONT, note_font, 1)
+            _outline_text(frame, line, (width - pad - tw, y), PAPER, note_font)
             y -= int(16 * scale)
 
 
@@ -1302,6 +1550,9 @@ class MatchStreamServer(ThreadingHTTPServer):
             team_rosters=team_rosters_for(RosterLibrary(), record.team_rosters if record else None),
         )
         session.refresh_numbers(numbers, numbers_note(library.path(match_id), jerseys, numbers, session._player_ids))
+        # Every request is a chance to notice a swap correction saved since the last one; the sidecar is tiny,
+        # so a stat per stream/frame request is cheap. A running stream additionally polls during render.
+        session.refresh_attack_if_changed(force=True)
         return session
 
 
@@ -1348,6 +1599,18 @@ class MatchStreamHandler(BaseHTTPRequestHandler):
         """``codec=hevc`` asks for H.265 (smaller files at equal quality, pickier players); else H.264."""
         value = str(query.get("codec", "h264")).strip().lower()
         return value if value in CODECS else "h264"
+
+    def _overlay_layers(self, query: dict) -> dict[str, bool]:
+        """The requested layers, plus the export-only scoreboard when ``scoreboard=1``.
+
+        The scoreboard lives outside :data:`OVERLAY_NAMES` so it can never turn on implicitly for the pitch
+        pane, stills or the index page: only the export preview asks for it. ``render``/``render_at`` already
+        accept it, so no drawing code changes are needed.
+        """
+        layers = parse_overlays(query.get("overlays"))
+        if self._flag(query, "scoreboard", default=False):
+            layers["scoreboard"] = True
+        return layers
 
     # -- routes -----------------------------------------------------------------------------------------------
     def do_GET(self) -> None:  # noqa: N802 - the base class's name
@@ -1564,7 +1827,7 @@ class MatchStreamHandler(BaseHTTPRequestHandler):
         session = self.server.session(match_id)
         width = int(self._float(query, "width", self.server.width, MIN_WIDTH, MAX_WIDTH))
         t = float(query.get("t", session.start_s))
-        overlay_layers = parse_overlays(query.get("overlays"))
+        overlay_layers = self._overlay_layers(query)
         frame = grab_frame(session.video, max(0.0, t), width=width)
         if frame is None:
             raise StreamError(f"could not decode a frame at {t:.1f}s")
@@ -1587,7 +1850,7 @@ class MatchStreamHandler(BaseHTTPRequestHandler):
             width = int(self._float(query, "width", self.server.width, MIN_WIDTH, MAX_WIDTH))
             rate = self._float(query, "rate", DEFAULT_RATE, MIN_RATE, MAX_RATE)
             start_s = float(query.get("start", session.start_s))
-            overlay_layers = parse_overlays(query.get("overlays"))
+            overlay_layers = self._overlay_layers(query)
             token = query.get("token", "")[:64]
             control = self.server.register_control(token) if token else None
             # A write timeout is the watchdog against a viewer that stops reading without closing - a browser
@@ -1642,7 +1905,7 @@ class MatchStreamHandler(BaseHTTPRequestHandler):
         rate = self._float(query, "rate", 1.0, MIN_RATE, MAX_RATE)
         audio = self._flag(query, "audio", default=True)
         codec = self._codec(query)
-        overlay_layers = parse_overlays(query.get("overlays"))
+        overlay_layers = self._overlay_layers(query)
         sample_fps = fps
         if rate > 1.0:
             # A faster clip keeps a 60 fps timeline: 4x samples 15 source fps, 8x samples 7.5. Encoding all 60
@@ -1785,7 +2048,7 @@ class MatchStreamHandler(BaseHTTPRequestHandler):
             rate = self._float(query, "rate", 1.0, MIN_RATE, MAX_RATE)
             audio = self._flag(query, "audio", default=True)
             codec = self._codec(query)
-            overlay_layers = parse_overlays(query.get("overlays"))
+            overlay_layers = self._overlay_layers(query)
             token = query.get("token", "")[:64]
             control = self.server.register_control(token) if token else None
             self.send_response(200)

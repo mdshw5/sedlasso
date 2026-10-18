@@ -52,6 +52,21 @@ def test_the_tag_bar_offers_every_event_type_on_the_playback_second() -> None:
     assert "state.pendingTags = state.pendingTags.filter" in html
 
 
+def test_a_swapped_attack_reopens_the_footage_so_its_scoreboard_agrees() -> None:
+    """The pitch arrows redraw from a new payload, but the footage's scoreboard is drawn server-side.
+
+    A swap must therefore re-open the footage pane as well; otherwise the animation shows the corrected ends
+    while the scoreboard beside it still points the old way. The viewer's place is kept, since the correction
+    is only about which way the arrows point.
+    """
+    html = COMPONENT.read_text()
+    load_data = html.split("async function loadData", 1)[1].split("function renderLegend", 1)[0]
+    assert "previousAttack" in load_data
+    assert "attackChanged" in load_data
+    assert "restartFootage()" in load_data
+    assert "previousTime" in load_data, "a correction of the ends must not reset the playback position"
+
+
 def test_the_component_fetches_the_replay_by_url() -> None:
     """The payload is megabytes; it must be fetched once, not pushed through component arguments."""
     html = COMPONENT.read_text()

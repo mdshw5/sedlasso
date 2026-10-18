@@ -21,6 +21,7 @@ from soccer_analytics.analysis.events import (
     detect_whistles,
     whistles_to_events,
 )
+from soccer_analytics.analysis import highlights as highlights_lib
 from soccer_analytics.analysis.highlights import (
     LEAD_S,
     PREVIEW_SETTINGS,
@@ -39,6 +40,7 @@ from soccer_analytics.analysis.highlights import (
 )
 from soccer_analytics.analysis.library import MatchLibrary
 from soccer_analytics.geometry.pitch_calibration import PitchCalibration
+from soccer_analytics.ingest.ffmpeg_reader import probe_video
 from soccer_analytics.ingest.video_reader import VideoWriter
 
 SR = 16000
@@ -497,6 +499,19 @@ def test_set_verdict_validates_the_index_and_the_value() -> None:
     assert log.review_counts()["unreviewed"] == 1
 
 
+def test_remove_deletes_exactly_one_event_and_validates_the_index() -> None:
+    """An individual tag can be deleted without disturbing the other events or their order."""
+    log = EventLog()
+    log.add(Event(time_s=10.0, type="goal", team=0))
+    log.add(Event(time_s=20.0, type="shot", team=1))
+    log.add(Event(time_s=30.0, type="other", source="audio"))
+    removed = log.remove(1)
+    assert removed.time_s == 20.0 and removed.type == "shot"
+    assert [event.time_s for event in log.events] == [10.0, 30.0]
+    with pytest.raises(IndexError):
+        log.remove(5)
+
+
 def test_discarding_rejected_candidates_keeps_everything_else() -> None:
     log = EventLog()
     log.add(Event(time_s=10.0, type="other", source="audio"))
@@ -625,6 +640,18 @@ def test_goal_tier_uses_goals_when_present() -> None:
     moments = build_moments(events)
     reel = select_reel("goals", moments)
     assert [m.event_type for m in reel.moments] == ["goal"]
+
+
+def test_saves_tier_uses_only_saves() -> None:
+    """The saves reel is a dedicated option: goals and shots must not pad it out."""
+    events = [
+        Event(time_s=10.0, type="save", team=1),
+        Event(time_s=40.0, type="goal", team=0),
+        Event(time_s=70.0, type="shot", team=0),
+    ]
+    reel = select_reel("saves", build_moments(events))
+    assert [m.event_type for m in reel.moments] == ["save"]
+    assert reel.duration_s <= TIER_SECONDS["saves"]
 
 
 def test_export_moment_writes_a_playable_preview(tmp_path: Path) -> None:
@@ -861,6 +888,67 @@ def test_a_light_preview_keeps_the_timeline_but_loses_the_frames(tmp_path: Path)
     assert light_frames < 90, f"the light preview still encodes {light_frames} frames for ten seconds"
 
 
+def _h264_clip(path: Path, *, seconds: int = 20, width: int = 320, height: int = 180, fps: int = 15) -> None:
+    """A small real H.264 file, so the copy path is exercised with the camera's own codec."""
+    import shutil
+    import subprocess
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        pytest.skip("ffmpeg not available to synthesize an H.264 clip")
+    made = subprocess.run(
+        [
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", f"testsrc=size={width}x{height}:rate={fps}:duration={seconds}",
+            "-c:v", "libx264", "-g", str(fps), "-pix_fmt", "yuv420p", str(path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if made.returncode != 0:
+        pytest.skip(f"could not synthesize an H.264 clip: {made.stderr.strip()[:120]}")
+
+
+def test_an_h264_reel_is_stream_copied_not_reencoded(tmp_path: Path, monkeypatch) -> None:
+    """The camera writes H.264, so a reel can keep the exact source bitstream instead of losing quality."""
+    source = tmp_path / "clip.mp4"
+    _h264_clip(source)
+    reel = select_reel("saves", build_moments([Event(time_s=5.0, type="save", team=0)]))
+
+    def must_not_encode(*args, **kwargs):
+        pytest.fail("an H.264 reel must be stream-copied")
+
+    monkeypatch.setattr(highlights_lib, "_encode_clip", must_not_encode)
+    out = export_reel(source, reel, tmp_path / "out" / "saves.mp4", use_gpu=False)
+    probe = probe_video(out)
+    assert (probe.width, probe.height) == (320, 180)
+    assert probe.fps == pytest.approx(15, abs=0.5)
+
+
+def test_a_failed_copy_join_falls_back_to_a_high_quality_encode(tmp_path: Path, monkeypatch) -> None:
+    """If a copy cannot be joined, the export still succeeds - at source geometry and export quality."""
+    source = tmp_path / "clip.mp4"
+    _h264_clip(source)
+    reel = select_reel("saves", build_moments([Event(time_s=5.0, type="save", team=0)]))
+    calls: list[dict] = []
+    original = highlights_lib._encode_clip  # noqa: SLF001 - the fallback's settings are under test
+
+    def fail_copy(*args, **kwargs):
+        raise RuntimeError("copy join failed")
+
+    def record_encode(*args, **kwargs):
+        calls.append(kwargs)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(highlights_lib, "_copy_reel", fail_copy)
+    monkeypatch.setattr(highlights_lib, "_encode_clip", record_encode)
+    out = export_reel(source, reel, tmp_path / "out" / "saves.mp4", use_gpu=False)
+    assert calls and calls[0]["high_quality"] is True
+    probe = probe_video(out)
+    assert (probe.width, probe.height) == (320, 180)
+    assert probe.fps == pytest.approx(15, abs=0.5)
+
+
 def test_export_reel_writes_a_playable_file(tmp_path: Path) -> None:
     source = tmp_path / "clip.mp4"
     width, height, fps = 320, 180, 15
@@ -872,20 +960,50 @@ def test_export_reel_writes_a_playable_file(tmp_path: Path) -> None:
 
     events = [Event(time_s=5.0, type="shot", team=0), Event(time_s=25.0, type="goal", team=1)]
     reel = select_reel("clip", build_moments(events))
-    out = export_reel(source, reel, tmp_path / "out" / "clip.mp4", width=320, use_gpu=False)
+    # No width/fps: an export follows the source, so this 320x180/15 fps clip must stay that way.
+    out = export_reel(source, reel, tmp_path / "out" / "clip.mp4", use_gpu=False)
     assert out.exists() and out.stat().st_size > 1000
-
-    import cv2
-
-    capture = cv2.VideoCapture(str(out))
-    frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-    capture.release()
-    assert frames > fps * 15, f"exported reel is too short ({frames} frames)"
+    probe = probe_video(out)
+    assert probe.duration_s >= 14.0, f"exported reel is too short ({probe.duration_s:.1f}s)"
+    assert (probe.width, probe.height) == (width, height)
+    assert probe.fps == pytest.approx(fps, abs=0.5)
 
     manifest = write_manifest(reel, source, tmp_path / "out" / "clip.json")
     payload = json.loads(manifest.read_text())
     assert payload["tier"] == "clip" and len(payload["moments"]) == len(reel.moments)
     assert reel_manifest(reel, source)["moments"][0]["reason"]
+
+
+@pytest.mark.parametrize(("gpu", "quality_flag", "preset"), [(False, "-crf", "medium"), (True, "-cq", "p6")])
+def test_high_quality_reel_cuts_use_the_export_presets(
+    tmp_path: Path, monkeypatch, gpu: bool, quality_flag: str, preset: str
+) -> None:
+    """A reel is not a preview: the encoder gets the near-lossless preset, not the cheap default."""
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"x")
+    commands: list[list[str]] = []
+
+    def fake_run(command, expected_s, progress):
+        commands.append(command)
+        Path(command[-1]).write_bytes(b"x" * 2048)
+        return 0, ""
+
+    monkeypatch.setattr(highlights_lib, "run_ffmpeg_with_progress", fake_run)
+    moment = moment_for_event(Event(time_s=1.0, type="save", team=0))
+    highlights_lib._encode_clip(  # noqa: SLF001 - the encoder's flags are the unit under test
+        source,
+        moment,
+        tmp_path / "out.mp4",
+        duration_s=1.0,
+        width=320,
+        fps=60,
+        use_gpu=gpu,
+        high_quality=True,
+    )
+    command = commands[0]
+    assert command[command.index(quality_flag) + 1] == "18"
+    assert command[command.index("-preset") + 1] == preset
+    assert "scale=320:-2:flags=lanczos,fps=60" in command
 
 
 def test_export_rejects_an_empty_reel(tmp_path: Path) -> None:

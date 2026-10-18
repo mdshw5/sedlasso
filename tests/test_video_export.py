@@ -7,10 +7,16 @@ not accidentally decode an 80-minute game through Python.
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from soccer_analytics.dashboard.export import ExportError, export_command, target_size
+from soccer_analytics.dashboard.export import (
+    ExportError,
+    export_command,
+    preview_stream_url,
+    target_size,
+)
 from soccer_analytics.ingest.source import WindowPiece
 
 
@@ -97,3 +103,44 @@ def test_an_unknown_codec_is_refused() -> None:
             output=Path("export.mp4"),
             has_audio=False,
         )
+
+
+def test_a_preview_url_maps_every_export_overlay_and_keeps_audio() -> None:
+    """The preview must exercise the same layer set the export will render: team boxes become the stream's
+    ``boxes``, the scoreboard rides its own flag, and the soundtrack stays on. H.264 is deliberate - the file
+    may be HEVC, but browsers cannot be assumed to decode that."""
+    url = preview_stream_url(
+        "2026-10-03_game",
+        base="http://match-host:8510/",
+        start_s=12.5,
+        width=1920,
+        fps=30,
+        team=True,
+        scoreboard=True,
+        ball=True,
+        numbers=True,
+        nonce=2,
+    )
+    parsed = urlparse(url)
+    assert parsed.scheme == "http" and parsed.netloc == "match-host:8510"
+    assert parsed.path == "/live/2026-10-03_game.mp4"
+    query = parse_qs(parsed.query)
+    assert query["start"] == ["12.5"]
+    assert query["fps"] == ["30"]
+    assert query["width"] == ["1920"]
+    assert query["overlays"] == ["boxes,numbers,ball"]
+    assert query["scoreboard"] == ["1"]
+    assert query["audio"] == ["1"]
+    assert query["codec"] == ["h264"]
+    assert query["_preview"] == ["2"], "the restart button must force a fresh player URL"
+
+
+def test_a_clean_preview_asks_for_no_layers_and_no_scoreboard() -> None:
+    url = preview_stream_url(
+        "m", base="http://match-host:8510", start_s=0.0, width=1280, fps=60
+    )
+    query = parse_qs(urlparse(url).query)
+    assert query["overlays"] == ["none"]
+    assert "scoreboard" not in query
+    assert query["audio"] == ["1"], "the export always carries the match audio when the source has it"
+    assert query["codec"] == ["h264"]

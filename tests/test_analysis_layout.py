@@ -18,6 +18,7 @@ import pytest
 from soccer_analytics.analysis import game as game_lib
 from soccer_analytics.analysis.library import (
     MatchLibrary,
+    MatchRecord,
     analysis_dir_for,
     analysis_id_for,
     discover_videos,
@@ -49,6 +50,21 @@ def test_the_analysis_directory_is_derived_from_the_video(footage_root: Path) ->
     assert analysis_id_for(video) == "2026-10-03_16-58-38-391"
     assert analysis_dir_for(video) == footage_root / "2026-10-03" / "analysis" / "2026-10-03_16-58-38-391"
     assert segments_root_for(video) == analysis_dir_for(video) / "segments"
+
+
+def test_saving_a_replay_writes_the_small_attack_sidecar(tmp_path: Path) -> None:
+    """The stream server polls this file to notice a swap; it must always exist and always hold the same
+    directions as the replay, including an explicit null when the build had none."""
+    library = MatchLibrary(tmp_path / "matches")
+    record = library.create(str(tmp_path / "x.mp4"))
+    attack = {"half_frame": 5, "directions": [[1, -1], [-1, 1]]}
+    library.save_replay(record.match_id, {"players": [], "attack": attack})
+    sidecar = json.loads((library.path(record.match_id) / "attack.json").read_text())
+    assert sidecar == {"attack": attack}
+
+    library.save_replay(record.match_id, {"players": []})
+    sidecar = json.loads((library.path(record.match_id) / "attack.json").read_text())
+    assert sidecar == {"attack": None}
 
 
 def test_the_id_uses_the_recording_date_not_today(tmp_path: Path) -> None:
@@ -145,6 +161,43 @@ def test_a_moved_footage_directory_still_opens_its_own_files(
     assert Path(reloaded.segments[0]).exists()
     assert Path(reloaded.segments[0]).is_relative_to(moved_day)
     assert fresh.match_for_video(moved_video) == record.match_id
+
+
+def test_the_attack_swap_setting_round_trips(tmp_path: Path) -> None:
+    """The user's side correction is part of the match record, so a reload keeps it."""
+    library = MatchLibrary(tmp_path)
+    library.save(MatchRecord(match_id="m", swap_attack=True))
+    assert library.load("m").swap_attack is True
+    assert MatchRecord(match_id="old").swap_attack is False, "archives without the field load as unswapped"
+
+
+def test_saved_clicks_follow_a_moved_game_manifest(footage_root: Path, tmp_path: Path) -> None:
+    """A calibration clicked on the manifest before a footage move still names the same recording.
+
+    Click sources are stored absolute (the recording's path when the calibration was made). When the footage
+    directory moves to another mount, that path is gone even though the manifest is the same file beside the
+    analysis. The library re-points it by the analysis-directory name - the game id - so the dashboard does not
+    refuse a valid calibration as if it had been clicked on different footage. A manifest from a different game
+    is left alone.
+    """
+    video = _fake_video(footage_root / "2026-10-03" / "16:28:37.784.MP4", size=100)
+    library = MatchLibrary()
+    record = library.create(video)
+    directory = library.path(record.match_id)
+    local_manifest = directory / "game.json"
+    local_manifest.write_text(
+        json.dumps({"game_id": record.match_id, "output": "game.mp4", "duration_s": 1.0, "clips": []})
+    )
+    clicks_path = directory / "clicks.json"
+    old_manifest = tmp_path / "old" / "2026-10-03" / "analysis" / record.match_id / "game.json"
+    clicks_path.write_text(json.dumps({"clicks": [], "pitch": [60.0, 40.0], "source": str(old_manifest)}))
+    assert library.load_clicks_source(record.match_id) == str(local_manifest)
+
+    other_manifest = tmp_path / "old" / "2026-10-03" / "analysis" / "2026-10-03_another_game" / "game.json"
+    clicks_path.write_text(json.dumps({"clicks": [], "pitch": [60.0, 40.0], "source": str(other_manifest)}))
+    assert library.load_clicks_source(record.match_id) == str(other_manifest), (
+        "a manifest from another game must not be mistaken for this match's"
+    )
 
 
 def test_a_game_manifest_sits_in_the_combined_videos_analysis_directory(footage_root: Path) -> None:

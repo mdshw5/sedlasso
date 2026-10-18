@@ -9,6 +9,7 @@ renderer as the live stream, so the exported picture and the stream cannot drift
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import quote, urlencode
 
 from soccer_analytics.dashboard.video import encoder_quality_args, pick_encoder
 from soccer_analytics.ingest.ffmpeg_reader import probe_video, run_ffmpeg_with_progress
@@ -30,6 +31,47 @@ def target_size(source_width: int, source_height: int, width: int) -> tuple[int,
     """The requested width and the even height that preserves the source aspect."""
     target_width = _even(width)
     return target_width, _even(target_width * source_height / max(1, source_width))
+
+
+def preview_stream_url(
+    match_id: str,
+    *,
+    base: str,
+    start_s: float,
+    width: int,
+    fps: float,
+    team: bool = False,
+    scoreboard: bool = False,
+    ball: bool = False,
+    numbers: bool = False,
+    nonce: int = 0,
+) -> str:
+    """The live-preview URL for one export's settings.
+
+    The export's overlay names and the stream's are not identical: "team" is the stream's ``boxes`` layer,
+    while the scoreboard is an export-only layer requested with ``scoreboard=1``. The preview is always H.264
+    with sound, because that is what browsers play; ``width``/``fps`` are the preview's own (the export may be
+    larger or H.265). ``nonce`` is a cache-buster for the Restart button.
+    """
+    layers = [
+        name
+        for name, enabled in (("boxes", team), ("numbers", numbers), ("ball", ball))
+        if enabled
+    ]
+    params = {
+        "start": f"{float(start_s):.1f}",
+        "fps": f"{max(1.0, float(fps)):g}",
+        "rate": "1",
+        "width": str(max(2, int(width))),
+        "overlays": ",".join(layers) or "none",
+        "audio": "1",
+        "codec": "h264",
+    }
+    if scoreboard:
+        params["scoreboard"] = "1"
+    if nonce:
+        params["_preview"] = str(int(nonce))
+    return f"{base.rstrip('/')}/live/{quote(str(match_id), safe='')}.mp4?{urlencode(params)}"
 
 
 def export_command(

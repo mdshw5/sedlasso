@@ -185,13 +185,16 @@ def aiming_goal(direction: int | None) -> str:
     return "toward the left goal" if direction < 0 else "toward the right goal"
 
 
-def roles_and_attack(report, detections, assignment, *, segment, pitch_length_m: float):
+def roles_and_attack(
+    report, detections, assignment, *, segment, pitch_length_m: float, swap_attack: bool = False
+):
     """Role labels and attack directions for the replay payload, from the tracks the report was built on.
 
     One place so the dashboard build and ``rebuild_match.py`` cannot ship different versions of the same
     analysis: roles come from ``analysis.roles`` (referee by range, keepers by the goal pockets) and the
     directions from ``analysis.event_detection.team_orientations``, measured per half against the game's own
-    kick-off/half-time marks when the segment belongs to a marked game.
+    kick-off/half-time marks when the segment belongs to a marked game. ``swap_attack`` applies the match's
+    user correction before the directions are written into the payload.
     """
     fps = float(segment.meta.get("fps", 5.0))
     start_s = float(segment.meta.get("start_s", 0.0))
@@ -203,7 +206,9 @@ def roles_and_attack(report, detections, assignment, *, segment, pitch_length_m:
         return stage_b._track_kit_evidence(detections, rows) if rows is not None else None
 
     roles = roles_lib.classify_roles(report.players, pitch_length_m=pitch_length_m, kit_evidence=kit_evidence)
-    orientations = event_detection.team_orientations(report.players, pitch_length_m, half_bounds=bounds)
+    orientations = event_detection.team_orientations(
+        report.players, pitch_length_m, half_bounds=bounds, swap=swap_attack
+    )
     half_frame = int(round((bounds[1] - start_s) * fps)) if bounds is not None else None
     return roles, attack_summary(orientations, half_frame=half_frame)
 

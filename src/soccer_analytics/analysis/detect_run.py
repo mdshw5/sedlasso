@@ -102,6 +102,7 @@ def run_detection(
         whistles=whistles,
         numbers=numbers,
         half_bounds=half_bounds,
+        swap_attack=bool(record.swap_attack),
         video=str(video or segment.meta.get("video", "")),
     )
     # Reconcile rather than append: the detector's own rows are replaced, so a re-run after a fix (or after a

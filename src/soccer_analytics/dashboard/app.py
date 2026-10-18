@@ -28,6 +28,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
@@ -102,6 +103,7 @@ from soccer_analytics.dashboard.pitch_clicks import (
     zoom_box,
 )
 from soccer_analytics.dashboard import timeline
+from soccer_analytics.dashboard.export import preview_stream_url
 from soccer_analytics.dashboard.match_state import match_footage
 from soccer_analytics.dashboard.reports import (
     DEFAULT_TEAM_NAMES,
@@ -657,7 +659,10 @@ def _build_report_and_replay(
         )
         advance(0.88, "Building the replay...")
         ball = _ball_track_for_replay(segment_dir, calibration, q, focal)
-        roles, attack = roles_and_attack(report, detections, assignment, segment=segment, pitch_length_m=length_m)
+        roles, attack = roles_and_attack(
+            report, detections, assignment, segment=segment, pitch_length_m=length_m,
+            swap_attack=bool(record.swap_attack),
+        )
         replay = build_replay(
             (length_m, width_m),
             float(segment.meta["fps"]),
@@ -2234,7 +2239,8 @@ def events_section(
     unreviewed candidate.
     """
     events = library.events(match_id)
-    team_names = library.load(match_id).team_names
+    record = library.load(match_id)
+    team_names = record.team_names
     # The game's marks turn an event's own recording time into a half and a match clock. They are re-found here
     # rather than read from a module global, because this section must stand on its own once the report exists.
     game_record_here = game_lib.find_for_video(video)
@@ -2335,6 +2341,64 @@ def events_section(
             f"Discarded {removed} rejected candidate(s); {len(log.events)} event(s) left.",
         )
 
+    swap_key = f"swap_attack::{match_id}"
+
+    def _set_swap_attack() -> None:
+        """Persist the user's correction and flip the directions already written into the replay.
+
+        The record is re-read first: this page is not the only writer a match can have, and saving a stale copy
+        would clobber another edit. Inverting the replay's ``attack.directions`` makes the pitch arrows and the
+        event table's aim change on the next run without rebuilding the report; a future rebuild and event run
+        both read the saved record setting and produce the same sides.
+        """
+        swap = bool(st.session_state.get(swap_key, False))
+        fresh = library.load(match_id)
+        if bool(fresh.swap_attack) == swap:
+            return
+        fresh.swap_attack = swap
+        library.save(fresh)
+        replay = library.load_replay(match_id)
+        if replay and isinstance(replay.get("attack"), dict):
+            directions = replay["attack"].get("directions") or []
+            replay["attack"]["directions"] = [
+                [(-int(direction) if direction else direction) for direction in pair] if pair else pair
+                for pair in directions
+            ]
+            library.save_replay(match_id, replay)
+        st.session_state["events_flash"] = (
+            "success",
+            "Attack directions swapped: the pitch arrows, the aim column and future detections now use the other "
+            "ends."
+            if swap
+            else "Attack directions restored to the measured sides.",
+        )
+
+    def _remove_event(index: int) -> None:
+        """Delete one row from the event log and keep every index-based picker on a valid row."""
+        log = library.events(match_id)
+        try:
+            removed = log.remove(int(index))
+        except (IndexError, TypeError, ValueError):
+            st.session_state["events_flash"] = (
+                "warning",
+                "That event is not in the list any more - pick it again.",
+            )
+            return
+        library.save_events(match_id, log)
+        for key in (f"pitch_clip_event::{match_id}", f"event_remove::{match_id}"):
+            current = st.session_state.get(key)
+            if not isinstance(current, int):
+                continue
+            if current > int(index):
+                st.session_state[key] = current - 1
+            elif current == int(index):
+                st.session_state[key] = min(int(index), len(log.events) - 1) if log.events else 0
+        st.session_state[f"event_remove_confirm::{match_id}"] = False
+        st.session_state["events_flash"] = (
+            "success",
+            f"Removed {removed.type} at {_clock(removed.time_s)} from the timeline.",
+        )
+
     st.subheader("Events and review")
     show_flash("events_flash")
     st.caption(
@@ -2346,6 +2410,18 @@ def events_section(
         "and the weak ones are yours to reject. Each row also says whether the act was attacking or defensive by "
         "its type, and - for the attacks - which goal the acting team was attacking then, from the same measured "
         "directions the arrows on the pitch use."
+    )
+    st.checkbox(
+        "Swap attacking and defending teams",
+        value=bool(record.swap_attack),
+        key=swap_key,
+        on_change=_set_swap_attack,
+        help=(
+            "Inverts every half's measured attack direction. Use it when the arrows, the aim column or the "
+            "detector's clearance sides have the teams the wrong way round; pressing it again restores the "
+            "measured sides. The correction is saved with the match, so a rebuilt report and a re-run detector "
+            "use the same sides."
+        ),
     )
     # The detector that adds to the review list sits with it: press it, then review what it adds below.
     st.button(
@@ -2427,6 +2503,32 @@ def events_section(
             f"Reviewed: {counts[VERDICT_TRUE]} true · {counts[VERDICT_FALSE]} false · "
             f"{counts['unreviewed']} still to look at."
         )
+        with st.expander("Remove an individual event", expanded=False):
+            st.caption(
+                "Deletes one row from `events.json`: a manual tag is gone until you tag it again, and a detected "
+                "candidate can come back if the detector is run again. This cannot be undone."
+            )
+            remove_index = st.selectbox(
+                "Event to remove",
+                range(len(events.events)),
+                format_func=lambda index: _event_label(
+                    events.events[index], index, _match_clock_for(events.events[index])
+                ),
+                key=f"event_remove::{match_id}",
+            )
+            confirmed = st.checkbox(
+                "Confirm removal",
+                value=False,
+                key=f"event_remove_confirm::{match_id}",
+            )
+            st.button(
+                "Remove this event",
+                key=f"remove_event::{match_id}",
+                disabled=not confirmed,
+                on_click=_remove_event,
+                args=(int(remove_index),),
+                help="Delete the selected event from the match's event log. This cannot be undone.",
+            )
         # Review the moment the jump picker above is on. Watching it, judging it and moving on all happen here,
         # next to the buttons that tag the same list - no separate preview panel to find and wait on a clip cut.
         if review_index is not None and 0 <= review_index < len(events.events):
@@ -2499,6 +2601,7 @@ def events_section(
     else:
         moments = build_moments(events.events, (payload or {}).get("momentum"))
         st.write(f"{len(moments)} candidate moment(s).")
+        st.caption("Reels keep the source's resolution, frame rate and picture quality.")
         for tier, seconds in TIER_SECONDS.items():
             reel = select_reel(tier, moments, match_duration_s=probe_cached(video).duration_s)
             tier_col, button_col = st.columns([3, 1])
@@ -2518,7 +2621,7 @@ def events_section(
                 export_reel(video, reel, out_path, use_gpu=True, progress=reporter, clip_offsets=_clip_offsets(video))
                 write_manifest(reel, video, out_path.with_suffix(".json"))
                 reporter(1.0, f"{tier} reel ready")
-                st.success(f"Wrote `{out_path.relative_to(REPO_ROOT)}`")
+                st.success(f"Wrote `{_location_label(out_path)}`")
 
 
 def show_flash(key: str) -> None:
@@ -4147,6 +4250,72 @@ else:
 # --------------------------------------------------------------------------------------------------------------
 
 
+def _stream_preview_base(port: int) -> str:
+    """Where the browser should reach the footage stream: the configured base, else this app's own host.
+
+    ``st.context.url`` is the URL the user opened the dashboard on (scheme + host + port), which is exactly what
+    the browser needs to reach the stream server on its separate port. An explicit ``SOCCER_STREAM_BASE`` wins
+    because a proxy may front the stream at a different path.
+    """
+    base = configured_base().strip()
+    if base:
+        return base.rstrip("/")
+    url = st.context.url if hasattr(st, "context") else None
+    if url:
+        parsed = urlparse(url)
+        if parsed.hostname:
+            return f"{parsed.scheme or 'http'}://{parsed.hostname}:{int(port)}"
+    return f"http://localhost:{int(port)}"
+
+
+def _export_preview(
+    match_id: str,
+    *,
+    start_s: float,
+    width: int,
+    fps: float,
+    codec_label: str,
+    team: bool,
+    scoreboard: bool,
+    ball: bool,
+    numbers: bool,
+    nonce: int,
+) -> None:
+    """Stream one live preview of the export's settings through the footage server.
+
+    The preview is H.264 at up to 1080p so it plays smoothly in the browser and exercises the same overlay
+    renderer as the file export. It starts at the analyzed window's beginning and runs to its end; the
+    Restart button changes ``nonce``, which reloads the player from that start.
+    """
+    port = configured_port()
+    if not is_reachable(port):
+        st.warning(
+            f"The footage stream is not running on port {port}. Start it with "
+            f"`scripts/run_match_stream.py --port {port}` (the replay section has a Start button), then "
+            "re-check this preview."
+        )
+        return
+    preview_width = max(320, min(1920, int(width))) // 2 * 2
+    preview_fps = max(1.0, min(float(fps), 60.0))
+    url = preview_stream_url(
+        match_id,
+        base=_stream_preview_base(port),
+        start_s=float(start_s),
+        width=preview_width,
+        fps=preview_fps,
+        team=team,
+        scoreboard=scoreboard,
+        ball=ball,
+        numbers=numbers,
+        nonce=int(nonce),
+    )
+    st.video(url)
+    st.caption(
+        f"Live H.264 preview at {preview_width}px and up to {preview_fps:g} fps with the selected overlays and "
+        f"match audio. The exported file uses {width}px, {fps:g} fps and {codec_label}."
+    )
+
+
 @st.fragment(run_every=POLL_SECONDS)
 def _video_export_progress(library: MatchLibrary, match_id: str) -> None:
     """Live state of the background export; a finished/failed run is terminal until the next press."""
@@ -4305,6 +4474,33 @@ def video_export_section(
     parts = [overlay_tag] if resolution_tag == overlay_tag else [overlay_tag, resolution_tag]
     output = match_dir / "exports" / f"{match_id}_{'_'.join(parts)}_{fps:g}fps_{codec}.mp4"
     st.caption(f"Saved under `{_location_label(output.parent)}` as `{output.name}`.")
+
+    preview = st.checkbox(
+        "Stream a preview of this output",
+        value=False,
+        key=f"export_preview::{match_id}",
+        help=(
+            "Plays the analyzed window with the selected overlays through the footage stream before the export "
+            "runs. The preview is H.264, capped at 1080p, and includes the match audio; the file uses the "
+            "resolution, frame rate and format above."
+        ),
+    )
+    if preview:
+        preview_seq_key = f"export_preview_seq::{match_id}"
+        if st.button("Restart preview", key=f"export_preview_restart::{match_id}"):
+            st.session_state[preview_seq_key] = int(st.session_state.get(preview_seq_key, 0)) + 1
+        _export_preview(
+            match_id,
+            start_s=float(segment.meta["start_s"]),
+            width=width,
+            fps=fps,
+            codec_label=codec_label,
+            team=team,
+            scoreboard=scoreboard,
+            ball=ball,
+            numbers=numbers,
+            nonce=int(st.session_state.get(preview_seq_key, 0)),
+        )
 
     st.button(
         "Export the match video",

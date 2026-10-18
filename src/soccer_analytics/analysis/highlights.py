@@ -1,8 +1,9 @@
 """Highlight reels: pick the moments, then cut them out of the source with ffmpeg.
 
-Three tiers, mirroring what the product describes:
+Four tiers, mirroring what the product describes:
 * ``clip``   - 15-30 s single moments, for sharing;
 * ``goals``  - 1-2 min of scoring plays (from manual tags, since no goal event is inferred);
+* ``saves``  - a short reel of the saves a human tagged;
 * ``match``  - a ~5 min summary spread across the whole match.
 
 Moment ranking is explicit and inspectable: manual tags outrank audio candidates, and momentum swings add weight, so
@@ -13,16 +14,15 @@ from __future__ import annotations
 
 import hashlib
 import json
-import subprocess
 import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 from soccer_analytics.analysis.events import VERDICT_FALSE, Event
 from soccer_analytics.ingest.ffmpeg_reader import run_ffmpeg_with_progress
-from soccer_analytics.ingest.source import ClipSource, as_source, concat_copies, window_segments
+from soccer_analytics.ingest.source import ClipSource, as_source, concat_copies, probe_source, window_segments
 
-TIER_SECONDS = {"clip": 24.0, "goals": 90.0, "match": 300.0}
+TIER_SECONDS = {"clip": 24.0, "goals": 90.0, "saves": 60.0, "match": 300.0}
 MIN_CLIP_S = 15.0
 MAX_CLIP_S = 30.0
 PREVIEW_DIR = "previews"  # previews sit under the match's highlights/ directory, one file per moment
@@ -41,6 +41,12 @@ AUDIO_WEIGHT = 1.0
 MOMENTUM_WEIGHT = 4.0
 LEAD_S = 4.0  # start a little before the moment so the build-up is included
 TAIL_S = 6.0
+# Exported reels are not previews: they keep the source's own resolution and frame rate and use a visually
+# near-lossless encode. Previews stay on the cheap/fast settings above. CRF 18 (x264) and CQ 18 (NVENC) are
+# close enough to the camera original that the reel is not the thing that softens a 4K60 recording.
+REEL_CRF = 18
+REEL_PRESET = "medium"
+REEL_NVENC_CQ = 18
 
 # What a preview costs, in the order of the trade. Reviewing a scan means watching ninety of these one after the
 # other, so the window is deliberately short (ten seconds, the blast four seconds in) and the question is only how
@@ -224,6 +230,8 @@ def select_reel(
         candidates = [m for m in moments if m.event_type in ("goal", "penalty")]
         if not candidates:
             candidates = [m for m in moments if m.event_type in ("shot", "save", "block")]
+    elif tier == "saves":
+        candidates = [m for m in moments if m.event_type == "save"]
     else:
         candidates = list(moments)
 
@@ -267,10 +275,11 @@ def _encode_clip(
     width: int,
     use_gpu: bool,
     audio_codecs: tuple[str, ...] = ("aac",),
-    fps: int = 30,
+    fps: float = 30.0,
     audio_only: bool = False,
     skip_frame: str | None = None,
     video_filter: str | None = None,
+    high_quality: bool = False,
     progress=None,
 ) -> Path:
     """Re-encode one moment window to a normalized H.264 MP4, trying each encoder until one works.
@@ -289,7 +298,8 @@ def _encode_clip(
 
     ``video_filter`` replaces the default scale-and-rate filter outright. The one caller that needs it is the
     player-centered cut, whose filter is a 'sendcmd'-driven moving crop rather than a fixed scale - everything else
-    about the encode (encoder fallbacks, audio codec, progress) stays the same.
+    about the encode (encoder fallbacks, audio codec, progress) stays the same. ``high_quality`` switches the
+    encoder to the near-lossless export preset; previews keep the cheap/fast one.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     last_error = ""
@@ -338,6 +348,7 @@ def _encode_clip(
                         fps=fps,
                         audio_only=audio_only,
                         skip_frame=skip_frame,
+                        high_quality=high_quality,
                         progress=piece_progress,
                     )
                     done += piece.duration_s
@@ -360,12 +371,20 @@ def _encode_clip(
             command += ["-vn", *_AUDIO_ENCODERS[codec]]
         else:
             command += [
-                "-vf", video_filter if video_filter else f"scale={width}:-2:flags=lanczos,fps={fps}",
+                "-vf", video_filter if video_filter else f"scale={width}:-2:flags=lanczos,fps={fps:g}",
                 "-c:v", "h264_nvenc" if gpu else "libx264",
-                "-preset", "p4" if gpu else "veryfast",
-                *_AUDIO_ENCODERS[codec],
-                "-movflags", "+faststart",
             ]
+            if gpu:
+                command += (
+                    ["-preset", "p6", "-tune", "hq", "-rc", "vbr", "-cq", str(REEL_NVENC_CQ), "-b:v", "0"]
+                    if high_quality
+                    else ["-preset", "p4"]
+                )
+            else:
+                command += (
+                    ["-preset", REEL_PRESET, "-crf", str(REEL_CRF)] if high_quality else ["-preset", "veryfast"]
+                )
+            command += [*_AUDIO_ENCODERS[codec], "-movflags", "+faststart"]
         command += [
             "-progress", "pipe:1", "-nostats",
             str(output_path),
@@ -454,32 +473,124 @@ def export_player_clip(
     return output, plan
 
 
-def export_reel(
+def _copy_window(
+    source: Path,
+    start_s: float,
+    duration_s: float,
+    output_path: Path,
+    *,
+    progress=None,
+) -> Path:
+    """Stream-copy one already-seekable window, keeping the source's exact picture and sound.
+
+    A copy cannot land mid-GOP: ``-ss`` starts at the keyframe at or before the window, which is why the reel's
+    moments carry lead-in and tail. That is the right trade for an export - the alternative is re-encoding and
+    losing some of a 4K camera original - and the copy is also far faster than an encode.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+        "-ss", f"{start_s:.3f}", "-i", str(source), "-t", f"{duration_s:.3f}",
+        "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-avoid_negative_ts", "make_zero",
+        "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", str(output_path),
+    ]
+    returncode, output = run_ffmpeg_with_progress(command, duration_s, progress)
+    if returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
+        raise RuntimeError(f"ffmpeg failed copying the clip at {start_s:.1f}s: {output or returncode}")
+    return output_path
+
+
+def _copy_clip(
+    source: str | Path,
+    moment: Moment,
+    output_path: Path,
+    *,
+    duration_s: float,
+    progress=None,
+) -> Path:
+    """Copy one moment window, resolving a game manifest into its clips as needed."""
+    source = Path(source)
+    cut_start = moment.clip_start_s if moment.clip_start_s is not None else moment.start_s
+    resolved = as_source(source)
+    if isinstance(resolved, ClipSource):
+        pieces = window_segments(resolved, cut_start, duration_s)
+        if not pieces:
+            raise RuntimeError(f"the moment at {cut_start:.1f}s lies outside the recording")
+        if len(pieces) > 1:
+            with tempfile.TemporaryDirectory(prefix="highlight_copy_pieces_") as tmp:
+                tmp_dir = Path(tmp)
+                parts: list[Path] = []
+                total = sum(piece.duration_s for piece in pieces) or duration_s
+                done = 0.0
+                for index, piece in enumerate(pieces):
+                    part = tmp_dir / f"piece_{index}.mp4"
+
+                    def piece_progress(fraction, base=done, span=piece.duration_s) -> None:
+                        if progress is not None:
+                            progress(min(1.0, (base + span * float(fraction)) / total))
+
+                    _copy_window(
+                        Path(piece.path), piece.start_s, piece.duration_s, part, progress=piece_progress
+                    )
+                    parts.append(part)
+                    done += piece.duration_s
+                concat_copies(parts, output_path)
+                return output_path
+        source = Path(pieces[0].path)
+        cut_start = pieces[0].start_s
+        duration_s = pieces[0].duration_s
+    return _copy_window(source, cut_start, duration_s, output_path, progress=progress)
+
+
+def _copy_reel(
     source: str | Path,
     reel: Reel,
-    output_path: str | Path,
+    output_path: Path,
     *,
-    width: int = 1920,
-    use_gpu: bool = True,
-    progress=None,
     clip_offsets: dict[str, float] | None = None,
+    progress=None,
 ) -> Path:
-    """Cuts the reel's moments out of ``source`` and joins them into one file.
+    """Cut every moment by stream copy and join the parts; raises if the parts cannot be joined."""
+    with tempfile.TemporaryDirectory(prefix="highlight_copy_") as tmp:
+        tmp_dir = Path(tmp)
+        parts: list[Path] = []
+        clip_share = 0.94 / len(reel.moments)
+        for index, moment in enumerate(reel.moments):
+            part = tmp_dir / f"part_{index:03d}.mp4"
+            on_source = moment_on_source(moment, source, clip_offsets=clip_offsets)
+            _copy_clip(
+                _moment_source(moment, source),
+                on_source,
+                part,
+                duration_s=max(MIN_CLIP_S, on_source.end_s - on_source.start_s),
+                progress=(
+                    None
+                    if progress is None
+                    else (lambda fraction, index=index: progress(clip_share * (index + fraction)))
+                ),
+            )
+            parts.append(part)
+        if progress is not None:
+            progress(0.96)
+        concat_copies(parts, output_path)
+    if progress is not None:
+        progress(1.0)
+    return output_path
 
-    Each moment is re-encoded (not stream-copied) so the cut lands exactly where intended instead of at the nearest
-    keyframe, and every part is normalized to the same size/rate before concatenation. ``progress`` covers the
-    whole reel: the clips dominate, the join is the final few percent.
 
-    ``clip_offsets`` maps a recording's path to where it starts inside ``source`` (from the game manifest). A moment
-    found in another recording - a whistle scanned on a single camera file, say - is translated through it, so the
-    reel cut from the combined game shows the moment rather than the same *number* of seconds of the wrong part.
-    """
-    source, output_path = Path(source), Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    if not reel.moments:
-        raise ValueError(f"reel {reel.tier!r} has no moments to export")
-
-    with tempfile.TemporaryDirectory() as tmp:
+def _encode_reel(
+    source: str | Path,
+    reel: Reel,
+    output_path: Path,
+    *,
+    width: int,
+    fps: float,
+    use_gpu: bool,
+    clip_offsets: dict[str, float] | None = None,
+    progress=None,
+) -> Path:
+    """The fallback: re-encode every moment at the source size/rate with export-quality settings."""
+    with tempfile.TemporaryDirectory(prefix="highlight_encode_") as tmp:
         tmp_dir = Path(tmp)
         parts: list[Path] = []
         clip_share = 0.97 / len(reel.moments)
@@ -492,7 +603,9 @@ def export_reel(
                 part,
                 duration_s=max(MIN_CLIP_S, on_source.end_s - on_source.start_s),
                 width=width,
+                fps=fps,
                 use_gpu=use_gpu,
+                high_quality=True,
                 progress=(
                     None
                     if progress is None
@@ -502,19 +615,70 @@ def export_reel(
             parts.append(part)
         if progress is not None:
             progress(0.98)
-
-        listing = tmp_dir / "parts.txt"
-        listing.write_text("".join(f"file '{part}'\n" for part in parts))
-        concat = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-            "-f", "concat", "-safe", "0", "-i", str(listing), "-c", "copy", str(output_path),
-        ]
-        result = subprocess.run(concat, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg failed joining the reel: {result.stderr.strip()}")
+        concat_copies(parts, output_path)
     if progress is not None:
         progress(1.0)
     return output_path
+
+
+def export_reel(
+    source: str | Path,
+    reel: Reel,
+    output_path: str | Path,
+    *,
+    width: int | None = None,
+    fps: float | None = None,
+    use_gpu: bool = True,
+    progress=None,
+    clip_offsets: dict[str, float] | None = None,
+) -> Path:
+    """Cuts the reel's moments out of ``source`` and joins them into one file.
+
+    An H.264 source - the camera's own codec - is cut by stream copy, so the reel's picture and sound are the
+    source's, not a downscaled or recompressed copy. Copy cuts land on keyframes; that is why moments carry
+    lead-in and tail. When a copy-join cannot work (a manifest whose clips differ, another codec, a join that
+    ffmpeg refuses), each part is re-encoded at the source's own size and rate with the high-quality settings
+    (:data:`REEL_CRF`) rather than the cheap preview ones, so the cut lands exactly. ``width``/``fps`` override
+    the source geometry for a deliberate downscale. ``progress`` covers the whole reel: the clips dominate, the
+    join is the final few percent.
+
+    ``clip_offsets`` maps a recording's path to where it starts inside ``source`` (from the game manifest). A moment
+    found in another recording - a whistle scanned on a single camera file, say - is translated through it, so the
+    reel cut from the combined game shows the moment rather than the same *number* of seconds of the wrong part.
+    """
+    source, output_path = Path(source), Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if not reel.moments:
+        raise ValueError(f"reel {reel.tier!r} has no moments to export")
+    probe = probe_source(source)
+    if width is None:
+        width = int(probe.width)
+    if fps is None or fps <= 0:
+        fps = float(probe.fps) or 30.0
+    width = max(2, int(width))
+    fps = max(1.0, float(fps))
+
+    # The camera writes H.264; a lossless stream copy keeps the source's exact picture and sound and needs no
+    # encode at all. A copy cuts on keyframes, which is why moments carry lead-in and tail. A manifest whose
+    # clips differ, or an unusual codec, can fail to join - then the fallback re-encodes at source size/rate
+    # with export quality rather than returning a broken reel.
+    if probe.codec == "h264":
+        try:
+            return _copy_reel(
+                source, reel, output_path, clip_offsets=clip_offsets, progress=progress
+            )
+        except (RuntimeError, OSError):
+            output_path.unlink(missing_ok=True)
+    return _encode_reel(
+        source,
+        reel,
+        output_path,
+        width=width,
+        fps=fps,
+        use_gpu=use_gpu,
+        clip_offsets=clip_offsets,
+        progress=progress,
+    )
 
 
 def preview_clip_name(moment: Moment, mode: str = "full") -> str:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import threading
 import time
 from pathlib import Path
@@ -27,6 +28,7 @@ from soccer_analytics.dashboard.stream import (
     MatchStreamServer,
     OVERLAY_NAMES,
     ROLE_BGR,
+    SCOREBOARD_BGR,
     StreamError,
     TeamStyle,
     ball_stamps,
@@ -72,7 +74,22 @@ def stream_case():
     return segment, calibration, q, focal, replay, track_boxes(report.players)
 
 
-def _annotated(stream_case, *, numbers=None, numbers_note=None, ball_records=(), notes=(), players=None, boxes=None, start_s=None, goals=None) -> AnnotatedMatch:
+def _annotated(
+    stream_case,
+    *,
+    numbers=None,
+    numbers_note=None,
+    ball_records=(),
+    notes=(),
+    players=None,
+    boxes=None,
+    start_s=None,
+    goals=None,
+    attack=None,
+    attack_path=None,
+    whistle_times=(),
+    half_source_s=None,
+) -> AnnotatedMatch:
     segment, calibration, q, focal, replay, track_boxes_all = stream_case
     return AnnotatedMatch(
         match_id="synthetic",
@@ -91,6 +108,10 @@ def _annotated(stream_case, *, numbers=None, numbers_note=None, ball_records=(),
         ball_records=list(ball_records),
         teams=[TeamStyle(name="Team A", bgr=(12, 34, 56)), TeamStyle(name="Team B", bgr=(200, 30, 30))],
         notes=list(notes),
+        attack=attack,
+        attack_path=attack_path,
+        whistle_times=list(whistle_times),
+        half_source_s=half_source_s,
         goals=goals,
     )
 
@@ -122,6 +143,120 @@ def test_the_scoreboard_draws_a_panel_without_any_other_layer(stream_case) -> No
         scoreboard=True,
     )
     assert frame.any(), "the scoreboard drew nothing"
+
+
+def test_the_scoreboard_moves_to_the_bottom_left_and_hides_the_burned_in_timer(stream_case) -> None:
+    """The camera's own wall clock lives in the lower-left; the scoreboard now covers it, not the top centre."""
+    match = _annotated(stream_case, goals=[(5.0, 0)])
+    frame = np.full((720, 1280, 3), 255, dtype=np.uint8)
+    timer = (8, 680, 96, 708)  # inside BURNED_TIMER_BOX at this frame size
+    frame[timer[1] : timer[3], timer[0] : timer[2]] = (0, 0, 255)
+    match.render(
+        frame,
+        0,
+        pitch=False,
+        boxes=False,
+        numbers=False,
+        ball=False,
+        hud=False,
+        debug=False,
+        scoreboard=True,
+    )
+    assert not np.any(np.all(frame[timer[1] : timer[3], timer[0] : timer[2]] == (0, 0, 255), axis=2)), (
+        "the burned-in timer must be behind the opaque patch"
+    )
+    assert np.all(frame[:80, :] == 255), "the scoreboard must no longer occupy the top centre"
+
+
+def test_the_scoreboard_stacks_the_teams_into_a_narrow_two_row_panel(stream_case) -> None:
+    """Stacking the teams is what buys the space: the panel must stay narrow and grow taller, not wider."""
+    match = _annotated(stream_case, goals=[(5.0, 0)])
+    frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+    match.render(
+        frame,
+        0,
+        pitch=False,
+        boxes=False,
+        numbers=False,
+        ball=False,
+        hud=False,
+        debug=False,
+        scoreboard=True,
+    )
+    dark = np.all(frame == SCOREBOARD_BGR, axis=2)
+    ys, xs = dark.nonzero()
+    assert xs.size and ys.size
+    assert ys.min() > 600, "the panel must stay in the lower-left corner"
+    assert xs.max() < 700, "the stacked panel should use well under half the frame width"
+    assert ys.max() - ys.min() > 40, "two stacked rows need more than a single line of height"
+
+
+def test_the_scoreboard_switches_attack_arrows_and_half_label_at_the_half_frame(stream_case) -> None:
+    """The arrows follow the replay's per-period directions, and the clock says which half it is."""
+    match = _annotated(
+        stream_case, attack={"half_frame": 5, "directions": [[1, -1], [-1, 1]]}
+    )
+    assert match.attack_directions(0) == [1, -1]
+    assert match.attack_directions(5) == [-1, 1]
+    assert match.half_label(0) == "1H"
+    assert match.half_label(5) == "2H"
+    plain = _annotated(stream_case)
+    assert plain.attack_directions(0) == [] and plain.half_label(0) == ""
+
+
+def test_the_half_label_flips_at_the_first_frame_at_or_after_the_mark(stream_case) -> None:
+    """The mark rarely lands exactly on a frame; the label must not show 1H for that one frame."""
+    probe = _annotated(stream_case, start_s=100.0)
+    match = _annotated(stream_case, start_s=100.0, half_source_s=100.0 + 5.2 / probe.fps)
+    assert match.half_label(4) == "1H"
+    assert match.half_label(5) == "2H"
+
+
+def test_the_scoreboard_whistle_indicator_lights_near_a_whistle(stream_case) -> None:
+    match = _annotated(stream_case)
+    match.whistles = [match.start_s + 2.0]
+    assert match.whistle_active(match.index_for(match.start_s + 2.1))
+    assert not match.whistle_active(match.index_for(match.start_s + 10.0))
+
+
+def test_the_scoreboard_rereads_swapped_attack_directions_from_the_sidecar(stream_case, tmp_path) -> None:
+    """Swapping in the dashboard rewrites the small sidecar; a running session must pick up the new ends."""
+    sidecar = tmp_path / "attack.json"
+    sidecar.write_text(json.dumps({"attack": {"half_frame": 5, "directions": [[1, -1], [-1, 1]]}}))
+    os.utime(sidecar, ns=(1_000_000_000, 1_000_000_000))
+    match = _annotated(
+        stream_case,
+        attack={"half_frame": 5, "directions": [[1, -1], [-1, 1]]},
+        attack_path=sidecar,
+    )
+    assert match.attack_directions(0) == [1, -1]
+
+    sidecar.write_text(json.dumps({"attack": {"half_frame": 5, "directions": [[-1, 1], [1, -1]]}}))
+    os.utime(sidecar, ns=(2_000_000_000, 2_000_000_000))
+    match.refresh_attack_if_changed(force=True)
+    assert match.attack_directions(0) == [-1, 1]
+    assert match.attack_directions(6) == [1, -1]
+
+
+def test_the_scoreboard_draws_the_new_layers_without_error(stream_case) -> None:
+    match = _annotated(
+        stream_case,
+        attack={"half_frame": 5, "directions": [[1, -1], [-1, 1]]},
+        whistle_times=[2.0],
+    )
+    frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+    match.render(
+        frame,
+        2,
+        pitch=False,
+        boxes=False,
+        numbers=False,
+        ball=False,
+        hud=False,
+        debug=False,
+        scoreboard=True,
+    )
+    assert frame.any()
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -428,17 +563,17 @@ def test_the_debug_layer_carries_the_diagnostics_and_switches_off_alone(stream_c
 
     top_left = (0, 60, 0, 500)  # session name (debug) and the legend (hud)
     below_clock = (35, 58, 1200, 1920)  # the frame counter sits under the clock
-    bottom_left = (1030, 1080, 0, 900)  # the notes
+    bottom_right = (1030, 1080, 900, 1920)  # the notes, right-aligned clear of the scoreboard
 
     hud_only = render(hud=True, debug=False)
     assert changed(hud_only, *top_left) > 0, "the team legend is the watching half's"
     assert changed(hud_only, *below_clock) == 0, "no frame counter without the debug layer"
-    assert changed(hud_only, *bottom_left) == 0, "no notes without the debug layer"
+    assert changed(hud_only, *bottom_right) == 0, "no notes without the debug layer"
 
     debug_only = render(hud=False, debug=True)
     assert changed(debug_only, *top_left) > 0, "the session name is the debug layer's"
     assert changed(debug_only, *below_clock) > 0, "the frame counter is the debug layer's"
-    assert changed(debug_only, *bottom_left) > 0, "the notes are the debug layer's"
+    assert changed(debug_only, *bottom_right) > 0, "the notes are the debug layer's"
 
 
 def test_the_hud_clock_reads_the_animation_clock_not_the_recording_clock(stream_case, monkeypatch) -> None:
@@ -756,6 +891,44 @@ def test_a_client_can_stop_its_own_stream(stream_case, tmp_path) -> None:
         stopper.request("GET", "/stop?token=abc123")
         assert stopper.getresponse().status == 200
         stopper.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_a_still_request_rereads_swapped_directions_before_drawing(stream_case, tmp_path, monkeypatch) -> None:
+    """The scoreboard is drawn server-side; a swap saved since the session loaded must be in the very next still."""
+    from soccer_analytics.dashboard import stream as stream_module
+
+    sidecar = tmp_path / "attack.json"
+    sidecar.write_text(json.dumps({"attack": {"half_frame": 5, "directions": [[1, -1], [-1, 1]]}}))
+    os.utime(sidecar, ns=(1_000_000_000, 1_000_000_000))
+    match = _annotated(
+        stream_case,
+        attack={"half_frame": 5, "directions": [[1, -1], [-1, 1]]},
+        attack_path=sidecar,
+    )
+    monkeypatch.setattr(
+        stream_module, "grab_frame", lambda _path, _at, *, width=0: np.zeros((180, 320, 3), dtype=np.uint8)
+    )
+    server = MatchStreamServer(("127.0.0.1", 0), root=tmp_path, reader_factory=_FakeReader, pace=False)
+    server._sessions["synthetic"] = match
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        url = f"/frame/synthetic.jpg?t={match.start_s + 1.0:.1f}&width=320&scoreboard=1"
+        connection = http.client.HTTPConnection(host, port, timeout=15)
+        connection.request("GET", url)
+        first = connection.getresponse().read()
+        assert first.startswith(b"\xff\xd8"), "the still is a JPEG"
+
+        sidecar.write_text(json.dumps({"attack": {"half_frame": 5, "directions": [[-1, 1], [1, -1]]}}))
+        os.utime(sidecar, ns=(2_000_000_000, 2_000_000_000))
+        connection.request("GET", url)
+        second = connection.getresponse().read()
+        assert second != first, "the scoreboard still showed the old ends after the swap"
+        connection.close()
     finally:
         server.shutdown()
         server.server_close()

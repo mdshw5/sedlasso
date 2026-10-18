@@ -506,6 +506,7 @@ class _FakeLiveChunks:
                 "start_s": start_s,
                 "fps": fps,
                 "width": width,
+                "overlays": dict(overlays),
                 "control": control,
                 "rate": rate,
                 "audio": audio,
@@ -542,6 +543,29 @@ def test_the_live_endpoint_streams_fragmented_mp4_and_registers_its_stop_token(t
         assert live.calls[0]["audio"] is False, "audio can be turned off per request"
         assert live.calls[0]["codec"] == "hevc", "the codec choice reaches the encoder"
         assert isinstance(live.calls[0]["control"], StreamControl), "the token must reach the stream"
+        connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_the_live_stream_can_request_the_export_scoreboard(tmp_path) -> None:
+    """The scoreboard is an export-only layer: it is off unless the request says ``scoreboard=1``, so the
+    pitch pane's stills and the index page never acquire it implicitly."""
+    match = _match()
+    live = _FakeLiveChunks()
+    server = _serve(tmp_path, match, live_chunks=live)
+    try:
+        host, port = server.server_address
+        connection = http.client.HTTPConnection(host, port, timeout=15)
+        connection.request("GET", "/live/synthetic.mp4?overlays=boxes,numbers&scoreboard=1")
+        response = connection.getresponse()
+        assert response.status == 200
+        assert response.read() == b"onetwo"
+        assert live.calls[0]["overlays"]["boxes"] is True
+        assert live.calls[0]["overlays"]["numbers"] is True
+        assert live.calls[0]["overlays"]["scoreboard"] is True
+        assert live.calls[0]["overlays"]["pitch"] is False
         connection.close()
     finally:
         server.shutdown()

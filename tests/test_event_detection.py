@@ -262,6 +262,15 @@ def test_orientation_reads_the_defending_side_from_where_players_stand() -> None
     assert orientations[0].attack_direction == {0: 1, 1: -1}
 
 
+def test_orientation_swap_flips_every_end_and_direction() -> None:
+    """The user's side correction inverts both the defended goal and the attack vector for each team."""
+    team0 = _track(1, 0, list(range(10)), [(15.0, 20.0)] * 10)
+    team1 = _track(2, 1, list(range(10)), [(45.0, 20.0)] * 10)
+    swapped = team_orientations([team0, team1], PITCH[0], swap=True)
+    assert swapped[0].defending_goal == {0: "right", 1: "left"}
+    assert swapped[0].attack_direction == {0: -1, 1: 1}
+
+
 def test_orientation_splits_by_half_when_the_clock_is_marked() -> None:
     """Teams change ends at half-time, so the sides are read per half from the game clock."""
     # Team 0 is at small x in the first half and large x in the second: it changed ends.
