@@ -533,3 +533,11 @@ def test_a_re_delivered_press_is_recognized_as_already_stored() -> None:
     # A detected candidate is not a manual tag: a human tagging what a detector also found is two rows on purpose.
     detected = Event(time_s=552.5, type="goal", team=0, source="ball", video="/v.mp4")
     assert repeated_manual_tag([detected], same) is None
+
+    # A goal is a moment, not a press: a second press while the replay is being watched is the same goal.
+    late_goal = Event(time_s=554.0, type="goal", team=0, video="/v.mp4")
+    assert repeated_manual_tag([stored], late_goal) is stored
+    # Other types keep the tight window - two separate tackles a second apart are two events.
+    tackle = Event(time_s=552.5, type="tackle", team=0, video="/v.mp4")
+    late_tackle = Event(time_s=554.0, type="tackle", team=0, video="/v.mp4")
+    assert repeated_manual_tag([tackle], late_tackle) is None

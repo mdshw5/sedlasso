@@ -16,7 +16,7 @@ import numpy as np
 from soccer_analytics.analysis.stage_a import SegmentData
 from soccer_analytics.geometry.camera_motion import integrate_poses
 from soccer_analytics.geometry.gimbal_motion import log_poses_for_segment
-from soccer_analytics.geometry.pitch_calibration import PitchCalibration, pixels_to_pitch
+from soccer_analytics.geometry.pitch_calibration import PitchCalibration, pitch_to_pixels, pixels_to_pitch
 
 # Typical foot-point localization error of a YOLO box bottom edge, in pixels at 1920 wide. Players' feet are not
 # always inside the box tightly (running poses, occlusion), so this is deliberately not 1.
@@ -184,6 +184,62 @@ def project_ball_track(
             xy[frame] = hit[0]
             measured[frame] = 1.0 if status == "tracking" else 0.0
     return xy, measured
+
+
+def goal_mouth_image(
+    calibration: PitchCalibration,
+    q: np.ndarray,
+    focal: np.ndarray,
+    pitch_length_m: float,
+    pitch_width_m: float,
+    goal_half_width_m: float,
+) -> np.ndarray:
+    """Where each goal mouth is in the picture, per frame: ``(F, 2, 3)``.
+
+    The last axis is ``(u_min, u_max, v_line)``: the two posts' normalized image x and the mean of their image y.
+    A ball is at that goal when its own ``(u, v)`` sits between the posts and around the line. Doing this test in
+    the picture is deliberate: the ground-plane projection is singular near the horizon, which is exactly where a
+    far goal sits, so a ball that is plainly in the net can project to ``NaN`` or to hundreds of meters out.
+
+    Side order is 0 = the x=0 goal, 1 = the x=L goal (the same convention :func:`event_detection._goal_mouth_hit`
+    uses). Frames whose goal line is behind the camera, or beyond the horizon, are NaN.
+    """
+    q = calibration.corrected_chain(q)
+    focal = calibration.corrected_focal(focal)
+    frames = min(len(q), len(focal))
+    out = np.full((frames, 2, 3), np.nan)
+    half_width = float(pitch_width_m) / 2.0
+    for side, goal_x in enumerate((0.0, float(pitch_length_m))):
+        posts = np.array([[goal_x, half_width - goal_half_width_m], [goal_x, half_width + goal_half_width_m]])
+        for frame in range(frames):
+            uv, in_front = pitch_to_pixels(calibration, posts, q[frame], focal[frame])
+            if in_front.all() and np.isfinite(uv).all():
+                out[frame, side] = (
+                    float(min(uv[0, 0], uv[1, 0])),
+                    float(max(uv[0, 0], uv[1, 0])),
+                    float(np.mean(uv[:, 1])),
+                )
+    return out
+
+
+def center_spot_image(
+    calibration: PitchCalibration,
+    q: np.ndarray,
+    focal: np.ndarray,
+    pitch_length_m: float,
+    pitch_width_m: float,
+) -> np.ndarray:
+    """The center spot in the picture, per frame: ``(F, 2)`` normalized ``(u, v)``, NaN where not in front."""
+    q = calibration.corrected_chain(q)
+    focal = calibration.corrected_focal(focal)
+    frames = min(len(q), len(focal))
+    out = np.full((frames, 2), np.nan)
+    center = np.array([[float(pitch_length_m) / 2.0, float(pitch_width_m) / 2.0]])
+    for frame in range(frames):
+        uv, in_front = pitch_to_pixels(calibration, center, q[frame], focal[frame])
+        if in_front[0] and np.isfinite(uv[0]).all():
+            out[frame] = uv[0]
+    return out
 
 
 def on_pitch_mask(

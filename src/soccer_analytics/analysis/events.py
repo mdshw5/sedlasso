@@ -381,6 +381,19 @@ def whistles_to_events(whistles: list[Whistle], *, video: str | Path = "") -> li
     ]
 
 
+def same_recording(left: str, right: str) -> bool:
+    """Whether two event video references name the same recording, even after the archive root moved.
+
+    An analysis tree can be moved (the real 2026-10-03 match was, and the old and new tags then carry different
+    absolute prefixes). The file name alone is not enough - several games can have a ``game.json`` - but the
+    analysis directory and file name together identify the recording within a match.
+    """
+    a, b = Path(str(left)), Path(str(right))
+    if a == b:
+        return True
+    return a.name == b.name and a.parent.name == b.parent.name
+
+
 @dataclass
 class EventLog:
     """All events for a match, human and audio-derived, kept in one place and serializable."""
@@ -393,19 +406,29 @@ class EventLog:
         self.events.append(event)
         self.events.sort(key=lambda e: e.time_s)
 
-    def add_detected(self, events: Iterable[Event], *, within_s: float = DUPLICATE_WINDOW_S) -> int:
+    def add_detected(
+        self,
+        events: Iterable[Event],
+        *,
+        within_s: float = DUPLICATE_WINDOW_S,
+        source: str | None = None,
+    ) -> int:
         """Add auto-detected candidates, skipping any already recorded within ``within_s`` of one of them.
 
         Returns how many were actually added, so the page can say "already recorded" rather than silently doing
         nothing. Only auto-detected events are compared against: a human tagging a goal at the moment a whistle
         sounds means two things happened, not one, so manual tags never suppress a candidate (and vice versa).
+        ``source`` limits the duplicate check to one detector's own rows - an audio whistle at the same moment as
+        a ball goal is a different event, not a duplicate of it.
         """
         added = 0
         for event in events:
             if event.source == "manual":
                 raise ValueError("add_detected is for auto-detected events; use add() for manual tags")
             if any(
-                other.source != "manual" and abs(other.time_s - event.time_s) < within_s
+                other.source != "manual"
+                and (source is None or other.source == source)
+                and abs(other.time_s - event.time_s) < within_s
                 for other in self.events
             ):
                 continue
@@ -415,6 +438,29 @@ class EventLog:
 
     def manual(self) -> list[Event]:
         return [e for e in self.events if e.source == "manual"]
+
+    def dedupe_manual_goals(self, within_s: float = 3.0) -> int:
+        """Drop manual goal tags that repeat the same goal within ``within_s``; returns how many were removed.
+
+        A goal is a moment, not a button press: two presses while the replay is being watched are one goal. The
+        first tag is kept; other event types are untouched, where two nearby tags can genuinely be two events.
+        """
+        kept: list[Event] = []
+        removed = 0
+        for event in self.events:
+            if event.source == "manual" and event.type == "goal" and any(
+                other.source == "manual"
+                and other.type == "goal"
+                and int(other.team) == int(event.team)
+                and same_recording(other.video, event.video)
+                and abs(float(other.time_s) - float(event.time_s)) < within_s
+                for other in kept
+            ):
+                removed += 1
+                continue
+            kept.append(event)
+        self.events = kept
+        return removed
 
     def detected(self) -> list[Event]:
         """Events no human put there - currently the whistle candidates from the audio scan.
@@ -500,7 +546,7 @@ class EventLog:
         old rows survive alongside the new ones and the queue shows every event twice.
         """
         fresh = list(events)
-        added = self.add_detected(fresh, within_s=within_s)
+        added = self.add_detected(fresh, within_s=within_s, source=source)
         kept: list[Event] = []
         dropped = 0
         for event in self.events:

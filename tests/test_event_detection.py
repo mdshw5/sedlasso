@@ -12,10 +12,12 @@ import pytest
 
 from soccer_analytics.analysis.event_detection import (
     BallMotion,
+    _dedupe_goals,
     ball_motion,
     detect_events,
     team_orientations,
 )
+from soccer_analytics.analysis.events import Event
 from soccer_analytics.analysis.stage_b import PlayerTrack
 
 FPS = 5.0
@@ -142,6 +144,145 @@ def test_a_forecast_reset_is_not_a_goal() -> None:
     measured[17:] = 0.0
     events = detect_events(xy, measured, times, [], PITCH)
     assert not any(e.type == "goal" for e in events), "a forecast reset is not a restart"
+
+
+def _image_goal_scene(
+    *,
+    frames: int = 120,
+    goal_frames: range = range(20, 36),
+    reset_frames: range | None = range(100, 116),
+    goal_side: int = 1,
+    moving_ball: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """A ball seen in the picture at the goal while its pitch projection is blind (NaN).
+
+    Returns ``(xy, measured, times, ball_uv, goal_mouth_uv, center_uv)``. The goal mouth is the right one by
+    default (side 1), at normalized u 0.4-0.6 and goal-line v 0.2; the ball sits at u=0.5, v=0.1 (behind the
+    line). The optional reset puts a measured ball at the center spot, in both pitch and picture space.
+    """
+    times = _times(frames)
+    xy = np.full((frames, 2), np.nan)
+    measured = np.zeros(frames)
+    ball_uv = np.full((frames, 2), np.nan)
+    mouth = np.full((frames, 2, 3), np.nan)
+    mouth[:, 0] = (-1.0, -1.0, -1.0)  # left goal behind the camera
+    mouth[:, 1] = (0.4, 0.6, 0.2)
+    for index, frame in enumerate(goal_frames):
+        measured[frame] = 1.0
+        # The pitch projection is deliberately NaN: this is the far-goal/horizon failure the image path exists for.
+        ball_uv[frame] = (0.5 + (0.002 * index if moving_ball else 0.0), 0.1)
+    if reset_frames is not None:
+        for frame in reset_frames:
+            measured[frame] = 1.0
+            xy[frame] = (30.0, 20.0)
+            ball_uv[frame] = (0.5, 0.25)
+    center_uv = np.tile(np.array([0.5, 0.25]), (frames, 1))
+    return xy, measured, times, ball_uv, mouth, center_uv
+
+
+def test_a_goal_is_confirmed_in_the_picture_when_the_pitch_projection_is_blind() -> None:
+    """At the far goal the ball can be at the horizon; the picture still shows it in the net."""
+    xy, measured, times, ball_uv, mouth, center_uv = _image_goal_scene()
+    events = detect_events(
+        xy,
+        measured,
+        times,
+        [],
+        PITCH,
+        goal_half_width_m=3.66,
+        ball_uv=ball_uv,
+        goal_mouth_uv=mouth,
+        center_uv=center_uv,
+    )
+    goals = [event for event in events if event.type == "goal"]
+    assert len(goals) == 1, [event.type for event in events]
+    assert "in the picture" in goals[0].note
+    assert goals[0].confidence == 0.65
+
+
+def test_a_picture_goal_without_a_reset_is_not_confirmed() -> None:
+    """A ball at the goal mouth is a crossing; only a restart (or a half boundary) confirms it."""
+    xy, measured, times, ball_uv, mouth, center_uv = _image_goal_scene(reset_frames=None)
+    events = detect_events(
+        xy,
+        measured,
+        times,
+        [],
+        PITCH,
+        goal_half_width_m=3.66,
+        ball_uv=ball_uv,
+        goal_mouth_uv=mouth,
+        center_uv=center_uv,
+    )
+    assert not any(event.type == "goal" for event in events), [event.type for event in events]
+
+
+def test_a_goal_on_the_stroke_of_half_time_uses_the_second_half_restart() -> None:
+    """A first-half goal's restart is the second-half kickoff, which is outside the half but inside the window."""
+    frames = 350
+    times = _times(frames)
+    xy = np.full((frames, 2), np.nan)
+    measured = np.zeros(frames)
+    ball_uv = np.full((frames, 2), np.nan)
+    mouth = np.full((frames, 2, 3), np.nan)
+    mouth[:, 0] = (0.4, 0.6, 0.2)
+    mouth[:, 1] = (-1.0, -1.0, -1.0)
+    for frame in range(0, 31):
+        measured[frame] = 1.0
+    for frame, x in zip(range(11, 16), (15.0, 10.0, 5.0, 0.5, 0.5)):
+        xy[frame] = (x, 20.0)
+    xy[16:31] = (0.5, 20.0)
+    for frame in range(14, 31):
+        ball_uv[frame] = (0.5, 0.1)
+    center_uv = np.tile(np.array([0.5, 0.25]), (frames, 1))
+    events = detect_events(
+        xy,
+        measured,
+        times,
+        [],
+        PITCH,
+        half_bounds=(0.0, 60.0, 80.0),
+        goal_half_width_m=3.66,
+        ball_uv=ball_uv,
+        goal_mouth_uv=mouth,
+        center_uv=center_uv,
+    )
+    goals = [event for event in events if event.type == "goal"]
+    assert len(goals) == 1, [event.type for event in events]
+    assert "second half" in goals[0].note
+
+
+def test_the_goal_width_setting_changes_the_mouth() -> None:
+    """A shot 4 m from the centre is outside a 9v9 goal and inside an 11-a-side one."""
+    positions: list[tuple[float, float] | None] = [(20.0, 24.0)] * 11
+    positions += [(15.0, 24.0), (10.0, 24.0), (5.0, 24.0), (0.5, 24.0), (0.5, 24.0)]
+    positions += [None, None, None]
+    positions += [(30.0, 20.0)] * 20
+    xy, measured, times = _ball(positions)
+    narrow = detect_events(xy, measured, times, [], PITCH, goal_half_width_m=2.44)
+    wide = detect_events(xy, measured, times, [], PITCH, goal_half_width_m=3.66)
+    assert not any(event.type == "goal" for event in narrow), [event.type for event in narrow]
+    assert any(event.type == "goal" for event in wide), [event.type for event in wide]
+
+
+def test_a_manual_offside_suppresses_a_goal_candidate() -> None:
+    """The ball went in, but the human said offside: the detector must not overrule that with a goal."""
+    positions: list[tuple[float, float] | None] = [(20.0, 20.0)] * 11
+    positions += [(15.0, 20.0), (10.0, 20.0), (5.0, 20.0), (0.5, 20.0), (0.5, 20.0)]
+    positions += [None, None, None]
+    positions += [(30.0, 20.0)] * 20
+    xy, measured, times = _ball(positions)
+    events = detect_events(xy, measured, times, [], PITCH, offside_times=[times[14]])
+    assert not any(event.type == "goal" for event in events), [event.type for event in events]
+
+
+def test_goal_dedupe_keeps_one_event_per_episode() -> None:
+    """A goal and its celebration/rebound within half a minute are one goal, not two."""
+    first = Event(time_s=100.0, type="goal", confidence=0.65, video="v")
+    second = Event(time_s=110.0, type="goal", confidence=0.8, video="v")
+    third = Event(time_s=160.0, type="goal", confidence=0.65, video="v")
+    kept = _dedupe_goals([first, second, third])
+    assert [event.time_s for event in kept] == [110.0, 160.0]
 
 
 def test_a_shot_without_a_reset_is_not_a_goal() -> None:

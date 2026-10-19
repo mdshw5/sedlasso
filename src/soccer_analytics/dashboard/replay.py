@@ -20,7 +20,7 @@ import numpy as np
 from soccer_analytics.analysis import event_detection, stage_b
 from soccer_analytics.analysis import game as game_lib
 from soccer_analytics.analysis import roles as roles_lib
-from soccer_analytics.analysis.events import EVENT_TYPES, Event
+from soccer_analytics.analysis.events import EVENT_TYPES, Event, same_recording
 from soccer_analytics.analysis.stage_b import PlayerTrack
 from soccer_analytics.dashboard.reports import team_name
 
@@ -105,7 +105,13 @@ def event_from_tag(tag: dict, *, video: str, window_start: float, duration_s: fl
     )
 
 
-def repeated_manual_tag(events: Sequence[Event], event: Event, *, within_s: float = 0.01) -> Event | None:
+def repeated_manual_tag(
+    events: Sequence[Event],
+    event: Event,
+    *,
+    within_s: float = 0.01,
+    goal_within_s: float = 3.0,
+) -> Event | None:
     """The already-stored manual tag that ``event`` repeats, if there is one.
 
     A press is delivered *at least* once, not exactly once: a page that reconnects after a server restart re-sends
@@ -114,14 +120,19 @@ def repeated_manual_tag(events: Sequence[Event], event: Event, *, within_s: floa
     every reel that uses it). Two manual tags of the same type for the same team on the same recording within a
     centisecond are one press; a different type, team, second or recording is a different event and is left alone.
     Detected candidates never match - a human tagging an event a detector also found is two rows on purpose.
+
+    Goals get a wider window: a goal is a moment, not a button press, and a second press while the replay is
+    being watched is the same goal. Other types keep the tight window, where two separate tags can be genuinely
+    different events.
     """
+    window = goal_within_s if event.type == "goal" else within_s
     for other in events:
         if (
             getattr(other, "source", "manual") == "manual"
             and other.type == event.type
             and int(other.team) == int(event.team)
-            and str(other.video) == str(event.video)
-            and abs(float(other.time_s) - float(event.time_s)) < within_s
+            and same_recording(other.video, event.video)
+            and abs(float(other.time_s) - float(event.time_s)) < window
         ):
             return other
     return None

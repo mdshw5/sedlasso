@@ -346,6 +346,18 @@ def test_goal_posts_sit_on_their_own_goal_line_either_side_of_the_goal_center() 
     assert len({label for label in table}) == len(table), "duplicate landmark names would break the dropdowns"
 
 
+def test_the_goal_width_override_moves_only_the_posts() -> None:
+    """A 9v9 pitch fitted with full-size goals needs the posts where those goals actually are."""
+    table = landmark_table(60.0, 40.0, format_name="9v9", goal_width_m=7.32)
+    assert table["goal post left-near"] == pytest.approx((0.0, 20.0 - 3.66))
+    assert table["goal post left-far"] == pytest.approx((0.0, 20.0 + 3.66))
+    assert table["goal post right-near"] == pytest.approx((60.0, 20.0 - 3.66))
+    assert table["goal post right-far"] == pytest.approx((60.0, 20.0 + 3.66))
+    # The rest of the 9v9 template is unchanged (the 7-yard center circle, not the 11-a-side 9.15 m one).
+    assert table["center circle near"] == pytest.approx((30.0, 20.0 - 7 * 0.9144))
+    assert "7.32 m" in landmark_help("9v9", goal_width_m=7.32)["goal post left-near"]
+
+
 def test_the_boxes_are_not_clickable() -> None:
     """The boxes are the markings the clicks cannot place accurately, so they must not be offered.
 

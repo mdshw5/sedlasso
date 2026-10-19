@@ -27,7 +27,7 @@ import cv2
 import numpy as np
 
 from soccer_analytics.geometry.pitch_calibration import Landmark, PitchCalibration, pitch_to_pixels
-from soccer_analytics.geometry.pitch_markings import markings_for
+from soccer_analytics.geometry.pitch_markings import markings_for, with_goal_width
 
 CLICK_MAX_WIDTH = 1600  # canvas pixels sent to the browser; small crops go at native size, which gives the accuracy
 
@@ -37,7 +37,11 @@ CLICK_MAX_WIDTH = 1600  # canvas pixels sent to the browser; small crops go at n
 
 
 def landmark_table(
-    length_m: float, width_m: float, *, format_name: str | None = None
+    length_m: float,
+    width_m: float,
+    *,
+    format_name: str | None = None,
+    goal_width_m: float | None = None,
 ) -> dict[str, tuple[float, float]]:
     """Pitch landmarks a user can click, in the order they should be clicked.
 
@@ -57,7 +61,7 @@ def landmark_table(
     a meter out is a meter of error in the fit. The posts carry that end of the pitch instead, and the penalty
     spots pin the box's depth.
     """
-    markings = markings_for(format_name)
+    markings = with_goal_width(markings_for(format_name), goal_width_m)
     half_length = length_m / 2
     half_width = width_m / 2
     half_goal = markings.goal_half_width_m
@@ -90,14 +94,17 @@ def landmark_table(
     return table
 
 
-def landmark_help(format_name: str | None = None) -> dict[str, str]:
+def landmark_help(
+    format_name: str | None = None, *, goal_width_m: float | None = None
+) -> dict[str, str]:
     """What each clickable landmark is, using the selected format's own distances.
 
     The distances matter: a 9v9 penalty spot is 9 yards out, not 11 m, and the posts are 16 feet apart, not 8
     yards. Telling a user to click "11 m out" on a pitch marked at 9 yards is a measurement instruction that is
-    wrong by two metres.
+    wrong by two metres. ``goal_width_m`` overrides the format's post spacing when the goals are a different size
+    from the format's markings.
     """
-    markings = markings_for(format_name)
+    markings = with_goal_width(markings_for(format_name), goal_width_m)
     posts = (
         "The base of the goalpost at the left-hand end, on the near side of the goal - where the post meets the goal "
         f"line. The posts are {markings.goal_width_m:.2f} m apart for this format, so the pair also fixes the goal "
@@ -159,9 +166,15 @@ def landmark_help(format_name: str | None = None) -> dict[str, str]:
 LANDMARK_HELP: dict[str, str] = landmark_help("11v11")
 
 
-def pitch_landmark_order(length_m: float, width_m: float, *, format_name: str | None = None) -> list[str]:
+def pitch_landmark_order(
+    length_m: float,
+    width_m: float,
+    *,
+    format_name: str | None = None,
+    goal_width_m: float | None = None,
+) -> list[str]:
     """The click order, which is also the order the landmark dropdowns default to."""
-    return list(landmark_table(length_m, width_m, format_name=format_name))
+    return list(landmark_table(length_m, width_m, format_name=format_name, goal_width_m=goal_width_m))
 
 
 def zoom_box(width: int, height: int, zoom: float, center_x: float, center_y: float) -> tuple[int, int, int, int]:

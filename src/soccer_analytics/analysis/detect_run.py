@@ -20,11 +20,21 @@ from pathlib import Path
 
 import numpy as np
 
-from soccer_analytics.analysis.event_detection import detect_events, player_tracks_from_replay
+from soccer_analytics.analysis.event_detection import (
+    GOAL_IMAGE_CONF_MIN,
+    detect_events,
+    player_tracks_from_replay,
+)
 from soccer_analytics.analysis.jerseys import merge_numbers
 from soccer_analytics.analysis.library import MatchLibrary
-from soccer_analytics.analysis.projection import project_ball_track, segment_poses
+from soccer_analytics.analysis.projection import (
+    center_spot_image,
+    goal_mouth_image,
+    project_ball_track,
+    segment_poses,
+)
 from soccer_analytics.analysis.stage_a import SegmentData, load_segment
+from soccer_analytics.geometry.pitch_markings import markings_for
 
 BALL_TRACK_FILE = "ball_track.json"  # written by scripts/run_ball_scan.py beside the segment
 
@@ -76,13 +86,45 @@ def run_detection(
         q, focal = poses
 
     ball = project_ball_track(payload["frames"], calibration, q, focal)
+    # The image-space copy feeds the goal-mouth test: a ball at the far goal can project to NaN while the picture
+    # shows it plainly in the net. Only measured, confident tracking frames are kept - a forecast is not evidence.
+    # It is indexed by the analysis frame, not by the record's position: a scan that skipped out-of-view frames has
+    # fewer records than the segment has frames.
+    ball_uv = np.full((len(segment.time), 2), np.nan)
+    for entry in payload["frames"]:
+        if entry.get("status") != "tracking" or entry.get("u") is None or entry.get("v") is None:
+            continue
+        if float(entry.get("conf") or 0.0) < GOAL_IMAGE_CONF_MIN:
+            continue
+        frame = int(entry.get("i", -1))
+        if 0 <= frame < len(ball_uv):
+            ball_uv[frame] = (float(entry["u"]), float(entry["v"]))
     record = library.load(match_id)
+    goal_width_m = (
+        float(record.goal_width_m)
+        if record.goal_width_m is not None
+        else float(markings_for(record.format).goal_width_m)
+    )
+    goal_mouth_uv = goal_mouth_image(
+        calibration,
+        q,
+        focal,
+        float(record.pitch_length_m),
+        float(record.pitch_width_m),
+        goal_width_m / 2.0,
+    )
+    center_uv = center_spot_image(
+        calibration, q, focal, float(record.pitch_length_m), float(record.pitch_width_m)
+    )
     fps = float(segment.meta["fps"])
     # Frame indices are within the analyzed window, so the tracks' times need the window's own start offset -
     # the kick-off offset from Step 1. Without it every player-derived event lands `start_s` too early.
     players = player_tracks_from_replay(replay, fps, float(segment.meta.get("start_s", 0.0)))
     times = np.asarray(segment.time, dtype=np.float64)
     log = library.events(match_id)
+    # A human can press "goal" twice while watching one goal; keep the first tag, not a duplicate row on the
+    # timeline and in every reel. This cleans existing logs as well as guarding future presses.
+    log.dedupe_manual_goals()
     # The whistle candidates are what tell a penalty from a free kick; read before the reconcile, which is what
     # leaves them alone (they are another detector's rows).
     whistles = [event.time_s for event in log.events if event.source == "audio"]
@@ -93,6 +135,11 @@ def run_detection(
         auto={int(key): value for key, value in (jerseys.get("suggestions") or {}).items()},
         manual=roster,
     )
+    offside_times = [
+        float(event.time_s)
+        for event in log.events
+        if event.source == "manual" and "offside" in (event.note or "").lower()
+    ]
     detected = detect_events(
         ball[0],
         ball[1],
@@ -104,6 +151,11 @@ def run_detection(
         half_bounds=half_bounds,
         swap_attack=bool(record.swap_attack),
         video=str(video or segment.meta.get("video", "")),
+        goal_half_width_m=goal_width_m / 2.0,
+        ball_uv=ball_uv,
+        goal_mouth_uv=goal_mouth_uv,
+        center_uv=center_uv,
+        offside_times=offside_times,
     )
     # Reconcile rather than append: the detector's own rows are replaced, so a re-run after a fix (or after a
     # better ball scan) cannot leave the previous run's rows behind. Whistles are a different source and are left

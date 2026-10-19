@@ -37,6 +37,7 @@ told from a shot - the same fast kick is one or the other depending on which goa
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -121,6 +122,28 @@ PENALTY_SPOT_RADIUS_M = 3.5
 CENTER_RADIUS_M = 12.0  # the ball is "back at the center" within this of the center spot
 RESET_WINDOW_S = 60.0  # a goal's center-spot reset has to follow within this
 RESET_MIN_S = 2.0  # ... and the ball has to *stay* there: a restart, not a ball rolling through the middle
+
+# --- image-space goal evidence --------------------------------------------------------------------------------
+# The ground-plane projection is singular at the far goal: a ball resting in the net can sit at or above the
+# horizon, so its pitch position is NaN (or hundreds of meters away) even though the picture shows it plainly in
+# the goal. The crossing and the rest are therefore also tested in the picture, against the posts projected into
+# the frame. The pitch-space path stays authoritative when it can see the ball; this is what fills its blind spot.
+GOAL_IMAGE_MARGIN_U = 0.10  # normalized frame width a ball may sit outside the posts and still be "at the goal"
+GOAL_IMAGE_REST_MARGIN_U = 0.12  # the rest/entry check is a little more forgiving: the line itself is uncertain
+GOAL_IMAGE_BEHIND = 0.16  # image-v above the goal line still counts as "in the net" (calibration/drift slack)
+GOAL_IMAGE_FRONT = 0.03  # ... and a little in front of the line is still at the mouth
+GOAL_IMAGE_MIN_RUN_S = 1.5  # a ball at the mouth for this long is evidence, not a pass-through
+GOAL_IMAGE_CONF_MIN = 0.5  # only tracking detections this confident are used for image-space evidence
+GOAL_EPISODE_GAP_S = 10.0  # runs this close are one goal episode (crossing, ball in the net, retrieval)
+GOAL_RESET_MIN_GAP_S = 8.0  # a restart sooner than this is more likely a goal kick than a center kickoff
+GOAL_REST_MIN_S = 2.0  # a ball at the goal this long is resting in the net, not passing behind it
+GOAL_SHORT_RESET_S = 3.0  # a center visit shorter than this needs a genuinely static ball to be believed
+GOAL_REST_STABLE_U = 0.03  # relative-to-the-goal image-x spread for that short-reset case
+GOAL_REST_STABLE_V = 0.008  # ... and its image-y spread
+GOAL_EVENT_DEDUPE_S = 30.0  # a goal and its rebound/celebration are one event
+CENTER_IMAGE_TOLERANCE = 0.08  # normalized image distance to the projected center spot for a *strict* reset
+RESET_RUN_MERGE_S = 3.0  # a scan that loses the ball for a moment still saw one restart
+OFFSIDE_SUPPRESS_S = 10.0  # a goal candidate this close to a manual offside tag is that offside
 DEFENSIVE_THIRD_FRACTION = 0.35  # the third of the pitch nearest a team's own goal
 ATTRIBUTION_RADIUS_M = 9.0  # a player this close to the ball is the one who played it
 TACKLE_RADIUS_M = 2.0  # a challenge happens right beside the ball
@@ -432,12 +455,19 @@ def _static_runs(motion: BallMotion, min_s: float) -> list[tuple[int, int]]:
     return runs
 
 
-def _goal_mouth_hit(motion: BallMotion, pitch_length_m: float, pitch_width_m: float) -> list[tuple[int, int]]:
+def _goal_mouth_hit(
+    motion: BallMotion,
+    pitch_length_m: float,
+    pitch_width_m: float,
+    *,
+    goal_half_width_m: float = GOAL_HALF_WIDTH_M,
+) -> list[tuple[int, int]]:
     """Frames where the ball is at a goal mouth moving toward the line, as ``(frame, side)``.
 
     ``side`` is 0 for the x=0 goal and 1 for the x=L goal. The ball has to be within :data:`GOAL_DEPTH_M` of the
     line, inside the mouth (with a margin), and moving toward that line - a ball rolling *away* from the goal at the
-    same spot is a goal kick, not a goal.
+    same spot is a goal kick, not a goal. ``goal_half_width_m`` is the match's measured goal half-width; the default
+    is the 11-a-side constant the module was originally tuned with.
 
     A *forecast* position is allowed here, and that is deliberate: the scan loses the ball as it crosses the line
     (the camera is still catching up, and the ball is against the net), so demanding a detection at the line would
@@ -450,7 +480,7 @@ def _goal_mouth_hit(motion: BallMotion, pitch_length_m: float, pitch_width_m: fl
     for i in range(motion.frames):
         if not np.isfinite(motion.xy[i, 0]) or not np.isfinite(motion.vx[i]):
             continue
-        if abs(motion.xy[i, 1] - center_y) > GOAL_HALF_WIDTH_M + GOAL_MOUTH_MARGIN_M:
+        if abs(motion.xy[i, 1] - center_y) > goal_half_width_m + GOAL_MOUTH_MARGIN_M:
             continue
         x = motion.xy[i, 0]
         if x <= GOAL_DEPTH_M and motion.vx[i] < -KICK_SPEED_MS:
@@ -501,6 +531,170 @@ def _center_reset_after(motion: BallMotion, pitch_length_m: float, pitch_width_m
     return None
 
 
+def _center_reset_runs(
+    motion: BallMotion,
+    pitch_length_m: float,
+    pitch_width_m: float,
+    *,
+    ball_uv: np.ndarray | None = None,
+    center_uv: np.ndarray | None = None,
+) -> list[tuple[int, int]]:
+    """All measured center-spot rest runs, as ``(start, end)`` frame indices (end exclusive).
+
+    The pitch-space rules mirror :func:`_center_reset_after`. When ``ball_uv`` and ``center_uv`` are supplied the
+    run must also sit within :data:`CENTER_IMAGE_TOLERANCE` of the projected center spot in the picture: a white
+    object that happens to project near the center (a player, a spare ball) is not a restart. Runs split by a short
+    gap are merged - a scan that loses the ball for a frame still saw one restart.
+    """
+    center = np.array([pitch_length_m / 2.0, pitch_width_m / 2.0])
+    runs: list[tuple[int, int]] = []
+    i = 0
+    while i < motion.frames:
+        if not motion.measured[i] or not np.isfinite(motion.xy[i, 0]):
+            i += 1
+            continue
+        if np.linalg.norm(motion.xy[i] - center) > CENTER_RADIUS_M:
+            i += 1
+            continue
+        if not (np.isfinite(motion.speed[i]) and motion.speed[i] < STATIC_SPEED_MS):
+            i += 1
+            continue
+        end = i
+        while end + 1 < motion.frames:
+            if motion.times[end + 1] - motion.times[end] > MAX_STEP_S:
+                break
+            if not motion.measured[end + 1] or not np.isfinite(motion.xy[end + 1, 0]):
+                break
+            if np.linalg.norm(motion.xy[end + 1] - center) > CENTER_RADIUS_M:
+                break
+            if not (np.isfinite(motion.speed[end + 1]) and motion.speed[end + 1] < STATIC_SPEED_MS):
+                break
+            end += 1
+        if motion.times[end] - motion.times[i] >= RESET_MIN_S:
+            runs.append((i, end + 1))
+        i = end + 1
+    merged: list[tuple[int, int]] = []
+    for start, end in runs:
+        if merged and motion.times[start] - motion.times[merged[-1][1] - 1] <= RESET_RUN_MERGE_S:
+            merged[-1] = (merged[-1][0], end)
+        else:
+            merged.append((start, end))
+    if ball_uv is None or center_uv is None:
+        return merged
+    strict: list[tuple[int, int]] = []
+    for start, end in merged:
+        balls = np.asarray(ball_uv[start:end], dtype=np.float64)
+        centers = np.asarray(center_uv[start:end], dtype=np.float64)
+        finite = np.isfinite(balls[:, 0]) & np.isfinite(centers[:, 0])
+        if finite.sum() < 2:
+            continue
+        offset = np.median(balls[finite] - centers[finite], axis=0)
+        if float(np.hypot(offset[0], offset[1])) <= CENTER_IMAGE_TOLERANCE:
+            strict.append((start, end))
+    return strict
+
+
+def _goal_image_runs(
+    motion: BallMotion,
+    ball_uv: np.ndarray,
+    goal_mouth_uv: np.ndarray,
+    side: int,
+    margin_u: float,
+) -> list[tuple[int, int]]:
+    """Runs where the ball is at one goal mouth **in the picture**, as ``(start, end)`` frame indices.
+
+    ``goal_mouth_uv`` is ``(F, 2, 3)`` from :func:`projection.goal_mouth_image`. A frame qualifies when a measured
+    ball lies between the projected posts (with ``margin_u``) and around the goal line. Gaps up to one second are
+    tolerated - the scan's confidence flickers - but the run as a whole must last :data:`GOAL_IMAGE_MIN_RUN_S`.
+    """
+    if motion.frames < 2:
+        return []
+    dt = float(np.median(np.diff(motion.times)))
+    gap_frames = max(1, int(round(1.0 / max(dt, 1e-6))))
+    limit = min(motion.frames, len(ball_uv), len(goal_mouth_uv))
+    hits: list[int] = []
+    for i in range(limit):
+        if not motion.measured[i] or not np.isfinite(ball_uv[i, 0]):
+            continue
+        u_min, u_max, v_line = goal_mouth_uv[i, side]
+        if not np.isfinite(u_min):
+            continue
+        u, v = float(ball_uv[i, 0]), float(ball_uv[i, 1])
+        if u_min - margin_u <= u <= u_max + margin_u and v_line - GOAL_IMAGE_BEHIND <= v <= v_line + GOAL_IMAGE_FRONT:
+            hits.append(i)
+    runs: list[tuple[int, int]] = []
+    for i in hits:
+        if runs and i - runs[-1][1] <= gap_frames:
+            runs[-1] = (runs[-1][0], i)
+        else:
+            runs.append((i, i))
+    minimum = max(1, int(round(GOAL_IMAGE_MIN_RUN_S / max(dt, 1e-6))))
+    return [(start, end) for start, end in runs if end - start + 1 >= minimum]
+
+
+def _goal_episodes(runs: list[tuple[int, int]], times: np.ndarray, side: int) -> list[tuple[int, int, int]]:
+    """Merge image runs this close into one episode: crossing, ball in the net and retrieval are one goal."""
+    episodes: list[tuple[int, int, int]] = []
+    for start, end in runs:
+        if episodes and times[start] - times[episodes[-1][1]] <= GOAL_EPISODE_GAP_S:
+            episodes[-1] = (episodes[-1][0], end, side)
+        else:
+            episodes.append((start, end, side))
+    return episodes
+
+
+def _goal_episode_stability(
+    ball_uv: np.ndarray,
+    goal_mouth_uv: np.ndarray,
+    start: int,
+    end: int,
+    side: int,
+) -> tuple[float, float]:
+    """How steady the ball's position is **relative to the goal frame** during an episode.
+
+    Camera panning moves a resting ball across the picture, so raw image coordinates say nothing about whether
+    the ball is still. Its offset from the goal-mouth centre cancels that: a ball at rest in the net stays at the
+    same offset, while a ball being passed around near the goal does not. Returns the image-x and image-y spread;
+    the short-center-visit path uses it to reject a white object that merely lingered near the goal.
+    """
+    offsets_u: list[float] = []
+    offsets_v: list[float] = []
+    for frame in range(start, end + 1):
+        if not np.isfinite(ball_uv[frame, 0]):
+            continue
+        u_min, u_max, v_line = goal_mouth_uv[frame, side]
+        if not np.isfinite(u_min):
+            continue
+        offsets_u.append(float(ball_uv[frame, 0]) - float((u_min + u_max) / 2.0))
+        offsets_v.append(float(ball_uv[frame, 1]) - float(v_line))
+    if len(offsets_u) < 2:
+        return (float("inf"), float("inf"))
+    return (float(np.std(offsets_u)), float(np.std(offsets_v)))
+
+
+def _ball_xy_near(motion: BallMotion, frame: int, radius: int = 8) -> tuple[float, float] | None:
+    """The ball's pitch position at ``frame``, or the nearest finite one: an image-space goal may have none."""
+    if np.isfinite(motion.xy[frame, 0]):
+        return (float(motion.xy[frame, 0]), float(motion.xy[frame, 1]))
+    for offset in range(1, radius + 1):
+        for candidate in (frame - offset, frame + offset):
+            if 0 <= candidate < motion.frames and np.isfinite(motion.xy[candidate, 0]):
+                return (float(motion.xy[candidate, 0]), float(motion.xy[candidate, 1]))
+    return None
+
+
+def _dedupe_goals(events: list[Event], gap_s: float = GOAL_EVENT_DEDUPE_S) -> list[Event]:
+    """Keep one goal per episode: a rebound or a celebration must not become a second goal."""
+    kept: list[Event] = []
+    for event in sorted(events, key=lambda e: (e.time_s, -e.confidence)):
+        clash = next((other for other in kept if abs(other.time_s - event.time_s) < gap_s), None)
+        if clash is None:
+            kept.append(event)
+        elif event.confidence > clash.confidence:
+            kept[kept.index(clash)] = event
+    return sorted(kept, key=lambda e: e.time_s)
+
+
 def _dedupe(events: list[Event], gap_s: float = MIN_EVENT_GAP_S) -> list[Event]:
     """Keep the most confident event of each type within ``gap_s`` of another of the same type."""
     kept: list[Event] = []
@@ -528,6 +722,12 @@ def detect_events(
     half_bounds: tuple[float, float, float] | None = None,
     swap_attack: bool = False,
     video: str = "",
+    goal_half_width_m: float | None = None,
+    ball_uv: np.ndarray | None = None,
+    goal_mouth_uv: np.ndarray | None = None,
+    center_uv: np.ndarray | None = None,
+    offside_times: Sequence[float] | None = None,
+    confirm_goal: Callable[[float, int], bool] | None = None,
 ) -> list[Event]:
     """Infer goals, shots, corners, penalties, clearances and tackles from the ball and player tracks.
 
@@ -536,6 +736,13 @@ def detect_events(
     in meters, ``whistles`` are the audio scan's candidate times (used only to tell a penalty from a free kick),
     ``numbers`` maps a track id to its shirt number/name, ``half_bounds`` is the game clock's
     ``(kick-off, half-time, full-time)``, and ``swap_attack`` inverts the measured ends (the match setting).
+
+    ``goal_half_width_m`` is the match's measured goal half-width (defaults to the 11-a-side constant).
+    ``ball_uv`` is the scan's per-frame image position, and ``goal_mouth_uv``/``center_uv`` are the projected goal
+    posts and center spot from :mod:`soccer_analytics.analysis.projection`; together they let a goal be confirmed in
+    the picture where the ground-plane projection is blind (the ball at the far goal is often at the horizon).
+    ``offside_times`` suppresses a goal candidate within :data:`OFFSIDE_SUPPRESS_S` of a manual offside tag, and
+    ``confirm_goal`` is an optional targeted re-scan for a crossing whose center reset the scan never saw.
 
     Returns events with ``source="ball"``, sorted by time. Every event carries a note saying what was measured, and
     the player it is attributed to when one is near enough to the ball to be named.
@@ -547,7 +754,22 @@ def detect_events(
     whistle_times = sorted(float(w) for w in (whistles or []))
 
     events: list[Event] = []
-    events += _goals(motion, length_m, width_m, by_frame, numbers, video)
+    events += _goals(
+        motion,
+        length_m,
+        width_m,
+        by_frame,
+        numbers,
+        video,
+        orientations=orientations,
+        goal_half_width_m=GOAL_HALF_WIDTH_M if goal_half_width_m is None else float(goal_half_width_m),
+        ball_uv=ball_uv,
+        goal_mouth_uv=goal_mouth_uv,
+        center_uv=center_uv,
+        offside_times=offside_times,
+        half_bounds=half_bounds,
+        confirm_goal=confirm_goal,
+    )
     # Penalties are found before shots so a penalty's own kick is not also reported as a shot: the two are the same
     # fast ball toward the goal, and the penalty is the more specific reading.
     events += _penalties(motion, length_m, width_m, by_frame, numbers, video, whistle_times)
@@ -565,39 +787,188 @@ def _goals(
     by_frame: dict[int, list[tuple[int, int, float, float]]],
     numbers: dict[int, dict] | None,
     video: str,
+    *,
+    orientations: list[HalfOrientation] | None = None,
+    goal_half_width_m: float = GOAL_HALF_WIDTH_M,
+    ball_uv: np.ndarray | None = None,
+    goal_mouth_uv: np.ndarray | None = None,
+    center_uv: np.ndarray | None = None,
+    offside_times: Sequence[float] | None = None,
+    half_bounds: tuple[float, float, float] | None = None,
+    confirm_goal: Callable[[float, int], bool] | None = None,
 ) -> list[Event]:
-    """A goal: the ball reaches a goal mouth moving in, and the ball is reset to the center spot soon after."""
+    """Goals from the pitch-space crossing and, where that projection is blind, the picture-space goal mouth.
+
+    The pitch-space rule is unchanged: the ball reaches a goal mouth moving in and a measured center-spot reset
+    follows. Two additions cover what this footage keeps exposing:
+
+    * the far goal sits at the horizon, so a ball in the net can project to ``NaN`` or hundreds of meters away.
+      The same crossing is therefore also tested against the posts projected into the frame. An **episode** of
+      the ball at the mouth that ends 8-60 s before a strict center-spot reset is a goal.
+    * a goal on the stroke of half-time has no center reset inside the analyzed half; the second-half kickoff is
+      that reset. A pitch crossing whose ball stays in the goal and whose half boundary follows within
+      :data:`RESET_WINDOW_S` is a goal.
+
+    ``goal_mouth_uv`` is ``(F, 2, 3)`` and ``center_uv`` is ``(F, 2)`` from :mod:`soccer_analytics.analysis.projection`;
+    ``ball_uv`` is the scan's own image position. Any of them may be omitted, in which case the pitch-space path
+    is used alone (the behavior older callers and the synthetic tests expect). ``confirm_goal`` is an optional
+    targeted re-scan: it is asked only about a crossing with no measured reset, and a true answer confirms it.
+    """
     out: list[Event] = []
-    for frame, side in _goal_mouth_hit(motion, length_m, width_m):
-        reset = _center_reset_after(motion, length_m, width_m, frame)
-        if reset is None:
-            continue
-        # The scorer is the player nearest the ball a moment *before* it crossed the line (0.4 s back, scaled to
-        # the analysis rate), searched either side of that moment.
-        lag = _lag_frames(motion)
+    lag = _lag_frames(motion)
+    offside = tuple(float(t) for t in (offside_times or ()))
+    image_available = ball_uv is not None and goal_mouth_uv is not None and center_uv is not None
+
+    def suppressed(time_s: float) -> bool:
+        return any(abs(time_s - when) <= OFFSIDE_SUPPRESS_S for when in offside)
+
+    def scorer_at(frame: int) -> tuple[int | None, int]:
+        position = _ball_xy_near(motion, frame)
+        if position is None:
+            return None, -1
         scorer = _nearest_player(
-            by_frame, max(0, frame - lag), tuple(motion.xy[frame]), ATTRIBUTION_RADIUS_M, search=lag
+            by_frame, max(0, frame - lag), position, ATTRIBUTION_RADIUS_M, search=lag
         )
-        track_id = scorer[0] if scorer else None
-        team = scorer[1] if scorer else -1
+        return (scorer[0], scorer[1]) if scorer else (None, -1)
+
+    def attacking_team(time_s: float, side: int) -> int:
+        """The team attacking that goal at ``time_s``, when no scorer is close enough to be named."""
+        orientation = _orientation_for(orientations or [], time_s, half_bounds)
+        if orientation is None:
+            return -1
+        wanted = -1 if side == 0 else 1
+        return next((team for team, direction in orientation.attack_direction.items() if direction == wanted), -1)
+
+    def add(frame: int, side: int, note: str, confidence: float) -> None:
+        time_s = float(motion.times[frame])
+        if suppressed(time_s):
+            return
+        track_id, team = scorer_at(frame)
+        if team < 0:
+            team = attacking_team(time_s, side)
         out.append(
             Event(
-                time_s=float(motion.times[frame]),
+                time_s=time_s,
                 type="goal",
                 team=team,
-                note=(
-                    f"ball crossed the {'left' if side == 0 else 'right'} goal line at "
-                    f"{motion.speed[frame]:.0f} m/s and was reset to the center spot "
-                    f"{motion.times[reset] - motion.times[frame]:.0f}s later"
-                ),
+                note=note,
                 source="ball",
-                confidence=0.8,
+                confidence=confidence,
                 video=video,
                 player_track=track_id,
                 player_number=_number_for(numbers, track_id),
             )
         )
-    return out
+
+    resets = (
+        _center_reset_runs(motion, length_m, width_m, ball_uv=ball_uv, center_uv=center_uv)
+        if image_available
+        else None
+    )
+
+    def reset_after(frame: int) -> int | None:
+        if resets is None:
+            return _center_reset_after(motion, length_m, width_m, frame)
+        deadline = motion.times[frame] + RESET_WINDOW_S
+        for start, _end in resets:
+            if motion.times[frame] <= motion.times[start] <= deadline:
+                return start
+        return None
+
+    pitch_hits = _goal_mouth_hit(motion, length_m, width_m, goal_half_width_m=goal_half_width_m)
+    pitch_reset: dict[int, int] = {}
+    for frame, side in pitch_hits:
+        reset = reset_after(frame)
+        if reset is None:
+            continue
+        pitch_reset[frame] = reset
+        add(
+            frame,
+            side,
+            f"ball crossed the {'left' if side == 0 else 'right'} goal line at "
+            f"{motion.speed[frame]:.0f} m/s and was reset to the center spot "
+            f"{motion.times[reset] - motion.times[frame]:.0f}s later",
+            0.8,
+        )
+
+    if image_available:
+        episodes: list[tuple[int, int, int]] = []
+        for side in (0, 1):
+            runs = _goal_image_runs(motion, ball_uv, goal_mouth_uv, side, GOAL_IMAGE_MARGIN_U)
+            episodes += _goal_episodes(runs, motion.times, side)
+        episodes.sort(key=lambda episode: motion.times[episode[0]])
+        used: set[int] = set()
+        for reset_start, _reset_end in resets or ():
+            reset_time = motion.times[reset_start]
+            before = [
+                (index, episode)
+                for index, episode in enumerate(episodes)
+                if index not in used and motion.times[episode[1]] <= reset_time
+            ]
+            if not before:
+                continue
+            index, episode = max(before, key=lambda pair: motion.times[pair[1][1]])
+            gap = reset_time - motion.times[episode[1]]
+            if not GOAL_RESET_MIN_GAP_S <= gap <= RESET_WINDOW_S:
+                continue
+            reset_duration = motion.times[_reset_end] - reset_time
+            if reset_duration < GOAL_SHORT_RESET_S:
+                spread_u, spread_v = _goal_episode_stability(
+                    ball_uv, goal_mouth_uv, episode[0], episode[1], episode[2]
+                )
+                if spread_u > GOAL_REST_STABLE_U or spread_v > GOAL_REST_STABLE_V:
+                    continue
+            used.add(index)
+            start, end, side = episode
+            add(
+                start,
+                side,
+                f"ball stayed at the {'left' if side == 0 else 'right'} goal mouth in the picture for "
+                f"{motion.times[end] - motion.times[start]:.0f}s and was reset to the center spot "
+                f"{gap:.0f}s later",
+                0.65,
+            )
+
+        # A crossing with no measured restart: accept it only when the ball visibly stayed in the goal and a
+        # period boundary (the second-half kickoff) supplies the center restart, or a targeted re-scan finds the
+        # ball on the center spot. This is the goal on the stroke of half-time, whose restart is the next half.
+        rest_runs: dict[int, list[tuple[int, int]]] = {}
+        for frame, side in pitch_hits:
+            if frame in pitch_reset:
+                continue
+            if side not in rest_runs:
+                rest_runs[side] = _goal_image_runs(
+                    motion, ball_uv, goal_mouth_uv, side, GOAL_IMAGE_REST_MARGIN_U
+                )
+            covering = [
+                (start, end)
+                for start, end in rest_runs[side]
+                if start - 1 <= frame <= end + 1 and motion.times[end] - motion.times[start] >= GOAL_REST_MIN_S
+            ]
+            if not covering:
+                continue
+            rest_s = max(motion.times[end] - motion.times[start] for start, end in covering)
+            reason: str | None = None
+            if half_bounds is not None:
+                _start, half, _end = half_bounds
+                if GOAL_RESET_MIN_GAP_S <= half - motion.times[frame] <= RESET_WINDOW_S:
+                    reason = (
+                        f"the second half restarted from the center spot "
+                        f"{half - motion.times[frame]:.0f}s later"
+                    )
+            if reason is None and confirm_goal is not None and confirm_goal(float(motion.times[frame]), side):
+                reason = "a center-spot ball was found on a targeted re-scan"
+            if reason is None:
+                continue
+            add(
+                frame,
+                side,
+                f"ball crossed the {'left' if side == 0 else 'right'} goal line and stayed in the goal for "
+                f"{rest_s:.0f}s; {reason}",
+                0.6,
+            )
+
+    return _dedupe_goals(out)
 
 
 def _shots(

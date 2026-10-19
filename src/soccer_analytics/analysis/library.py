@@ -238,6 +238,9 @@ class MatchRecord:
     pitch_length_m: float = 100.0
     pitch_width_m: float = 64.0
     format: str = "11v11"
+    # The measured distance between the posts, when it differs from the format's template. A 9v9 pitch fitted
+    # with full-size goals is common on shared grounds; None keeps the format's own goal width.
+    goal_width_m: float | None = None
     created: float = field(default_factory=time.time)
     team_names: list[str] = field(default_factory=lambda: ["Team A", "Team B"])
     # Some footage makes the measured ends ambiguous (or the team clustering swaps sides). This inverts every

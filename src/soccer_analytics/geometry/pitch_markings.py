@@ -14,7 +14,7 @@ Widths are full widths across the pitch; the drawing code takes halves.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 YARD_M = 0.9144
 FOOT_M = 0.3048
@@ -117,6 +117,18 @@ MARKINGS_BY_FORMAT: dict[str, PitchMarkings] = {
     "9v9": NINE_A_SIDE,
     "11v11": ELEVEN_A_SIDE,
 }
+
+
+def with_goal_width(markings: PitchMarkings, goal_width_m: float | None) -> PitchMarkings:
+    """The format's markings with a measured goal width substituted, when one is given.
+
+    A pitch can be marked for one format and fitted with goals of another size (a 9v9 pitch using full-size
+    frames is common on shared grounds). The format still supplies every other marking; only the goal mouth and
+    the goal-post landmarks move.
+    """
+    if goal_width_m is None:
+        return markings
+    return replace(markings, goal_width_m=float(goal_width_m))
 
 
 def markings_for(format_name: str | None) -> PitchMarkings:

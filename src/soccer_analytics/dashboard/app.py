@@ -76,7 +76,7 @@ from soccer_analytics.analysis.projection import project_ball_track, project_seg
 from soccer_analytics.analysis.rosters import RosterLibrary, team_rosters_for
 from soccer_analytics.analysis.stage_a import SegmentConfig, load_segment, read_status, resolve_window, segment_dir_for
 from soccer_analytics.geometry.gimbal_motion import segment_has_log, segment_pose_source
-from soccer_analytics.geometry.pitch_markings import markings_for
+from soccer_analytics.geometry.pitch_markings import markings_for, with_goal_width
 from soccer_analytics.dashboard.pitch_clicks import (
     actual_center,
     canvas_scale,
@@ -3388,17 +3388,20 @@ if segment is not None:
     # dimensions, so reading them back from the record is what stops the two drifting apart across reloads.
     record = library.load(match_id)
     stored_format = record.format if record.format in MATCH_FORMATS else list(MATCH_FORMATS)[-2]
-    format_col, length_col, width_col = st.columns([2, 1, 1])
+    format_col, length_col, width_col, goal_col = st.columns([2, 1, 1, 1])
     with format_col:
         format_name = st.selectbox(
             "Match format", list(MATCH_FORMATS), index=list(MATCH_FORMATS).index(stored_format)
         )
     # Youth pitches are marked to the format's convention but not to a surveyor's tolerance. The format supplies
-    # the templates (markings, landmark list); these two numbers are what the click coordinates are actually built
+    # the templates (markings, landmark list); these numbers are what the click coordinates are actually built
     # from, so a field measured at 64 x 42 m is calibrated as 64 x 42 m instead of being forced onto 60 x 40.
     default_length, default_width = MATCH_FORMATS[format_name]
     if record.format == format_name:
         default_length, default_width = record.pitch_length_m, record.pitch_width_m
+    default_goal_width = markings_for(format_name).goal_width_m
+    if record.format == format_name and record.goal_width_m is not None:
+        default_goal_width = record.goal_width_m
     with length_col:
         length_m = st.number_input(
             "Pitch length (m)",
@@ -3419,7 +3422,21 @@ if segment is not None:
             key=f"pitch_width::{match_id}::{format_name}",
             help="Measure across the pitch, touchline to touchline.",
         )
-    markings = markings_for(format_name)
+    with goal_col:
+        goal_width_m = st.number_input(
+            "Goal width (m)",
+            min_value=1.0,
+            max_value=20.0,
+            value=float(default_goal_width),
+            step=0.1,
+            key=f"goal_width::{match_id}::{format_name}",
+            help=(
+                "Distance between the posts. The format supplies the default (9v9: 4.88 m, 11v11: 7.32 m); "
+                "set the measured value when the goals are a different size. Goal detection and the goal-post "
+                "landmarks use this."
+            ),
+        )
+    markings = with_goal_width(markings_for(format_name), goal_width_m)
     markings_detail = (
         f"{markings.penalty_area_width_m:.2f} x {markings.penalty_area_depth_m:.2f} m penalty area"
         + (
@@ -3435,22 +3452,33 @@ if segment is not None:
         + f", {markings.goal_width_m:.2f} m goal"
     )
     st.caption(f"**{format_name} markings:** {markings_detail}. These are the markings the fit and overlay expect.")
-    if (record.format, record.pitch_length_m, record.pitch_width_m) != (format_name, length_m, width_m):
+    record_goal_width = (
+        record.goal_width_m
+        if record.goal_width_m is not None
+        else markings_for(record.format).goal_width_m
+    )
+    if (record.format, record.pitch_length_m, record.pitch_width_m, record_goal_width) != (
+        format_name,
+        length_m,
+        width_m,
+        goal_width_m,
+    ):
         had_calibration = library.load_calibration(match_id) is not None
         record.format, record.pitch_length_m, record.pitch_width_m = format_name, length_m, width_m
+        record.goal_width_m = float(goal_width_m)
         library.save(record)
         st.session_state.pop("calibration", None)
         if had_calibration:
             st.warning(
-                "The pitch size changed after this match was calibrated, so the saved calibration no longer matches. "
-                "Click the landmarks again before relying on the report."
+                "The pitch or goal size changed after this match was calibrated, so the saved calibration no "
+                "longer matches. Click the landmarks again before relying on the report."
             )
 
     # q/focal come from the same cache as the segment: rebuilding the chain costs ~1 s on the whole-game segment
     # even with the fast path, and this line is on the gesture loop's hot path.
     frame_count = len(segment.time)
-    land_table = landmark_table(length_m, width_m, format_name=format_name)
-    help_table = landmark_help(format_name)
+    land_table = landmark_table(length_m, width_m, format_name=format_name, goal_width_m=goal_width_m)
+    help_table = landmark_help(format_name, goal_width_m=goal_width_m)
     names = list(land_table)
 
     # Clicks belong to one match, one video and one pitch size. Switching any of them must not quietly blend the

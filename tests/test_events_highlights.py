@@ -348,6 +348,27 @@ def test_rescanning_does_not_duplicate_detected_events() -> None:
     assert [e.time_s for e in log.events] == [10.0, 12.0, 40.0]
 
 
+def test_a_whistle_does_not_suppress_a_goal_from_another_detector() -> None:
+    """A whistle and a ball goal at the same moment are two observations, not two copies of one row."""
+    log = EventLog()
+    assert log.add_detected([Event(time_s=10.0, type="other", source="audio")]) == 1
+    assert log.add_detected([Event(time_s=10.2, type="goal", source="ball")], source="ball") == 1
+    assert len(log.events) == 2
+
+
+def test_repeated_manual_goals_are_collapsed_but_other_events_are_not() -> None:
+    """Two presses for one goal are one goal; a shot or the other team's goal in the same second is not."""
+    log = EventLog()
+    log.add(Event(time_s=10.0, type="goal", team=0, video="v"))
+    log.add(Event(time_s=10.6, type="goal", team=0, video="v"))  # the same goal, pressed again
+    log.add(Event(time_s=10.6, type="goal", team=1, video="v"))  # the other team: a different goal
+    log.add(Event(time_s=10.2, type="shot", team=0, video="v"))
+    log.add(Event(time_s=15.0, type="goal", team=0, video="v"))  # a later goal
+    log.add(Event(time_s=10.1, type="goal", team=0, source="ball", video="v"))  # detected, never touched
+    assert log.dedupe_manual_goals() == 1
+    assert [event.time_s for event in log.events] == [10.0, 10.1, 10.2, 10.6, 15.0]
+
+
 def test_a_manual_tag_does_not_hide_a_detected_candidate() -> None:
     """A goal tagged by hand and a whistle at the same moment are two events, not one."""
     log = EventLog()
