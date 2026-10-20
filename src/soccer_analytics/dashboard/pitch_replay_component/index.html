@@ -168,6 +168,32 @@
         pointer-events: none; /* the strip's own clicks still land on the canvas under it */
         box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
       }
+      #event-menu {
+        position: fixed;
+        z-index: 40;
+        min-width: 190px;
+        padding: 4px;
+        background: #1f2937;
+        color: white;
+        border: 1px solid #374151;
+        border-radius: 6px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+        font-size: 12px;
+      }
+      #event-menu[hidden] { display: none; }
+      #event-menu button {
+        display: block;
+        width: 100%;
+        padding: 6px 10px;
+        border: 0;
+        border-radius: 4px;
+        background: transparent;
+        color: inherit;
+        font: inherit;
+        text-align: left;
+        cursor: pointer;
+      }
+      #event-menu button:hover, #event-menu button:focus-visible { background: #334155; }
       #legend {
         display: flex;
         flex-wrap: wrap;
@@ -311,17 +337,20 @@
         <div id="footage-note"></div>
       </div>
     </div>
-    <div id="timeline" title="Click to jump to that moment">
+    <div id="timeline" title="Click to jump to that moment; right-click a marker to delete it">
       <canvas id="tl"></canvas>
     </div>
     <div id="tl-hint">
       The strip above is the match timeline: the momentum curve (share of contested frames, team 1 above the
       center line) with every tagged and detected event on its own type's track - the shape says the kind of
       moment (&#9650; offensive, &#9632; defensive, &#9679; other), filled where tagged and hollow where detected.
-      Click it to jump the replay to that moment, hover a marker to see the event, or use the event arrows
-      beside play to step between them.
+      Click it to jump the replay to that moment, hover a marker to see the event, right-click a marker to
+      delete it, or use the event arrows beside play to step between them.
     </div>
     <div id="tl-popover"></div>
+    <div id="event-menu" role="menu" hidden>
+      <button id="event-menu-delete" type="button" role="menuitem"></button>
+    </div>
     <div id="legend"></div>
     <div id="empty">Waiting for the replay data...</div>
 
@@ -333,8 +362,9 @@
         RENDER_EVENT: 'streamlit:render',
         events: new EventTarget(),
         setComponentValue(value) {
-          // Only the tag buttons use this. Playback never round-trips to Python: a value per frame would re-render
-          // the whole page per frame, which is exactly what this component exists to avoid.
+          // Only the store gestures use this (a tag press and a right-click delete), through postAction.
+          // Playback never round-trips to Python: a value per frame would re-render the whole page per frame,
+          // which is exactly what this component exists to avoid.
           window.parent.postMessage(
             {isStreamlitMessage: true, type: 'streamlit:setComponentValue', value},
             '*'
@@ -459,6 +489,11 @@
         tagSeq: 0,
         pendingTags: [],
         tagTeamValue: '-1',
+        // Right-click deletes use the same contract: each gesture is sequenced, and its marker is hidden while
+        // the store confirms it. A failed delete is acknowledged too, so the stored marker comes back instead of
+        // staying hidden forever.
+        deleteSeq: 0,
+        pendingDeletes: [],
       };
 
       const canvas = document.getElementById('canvas');
@@ -475,6 +510,8 @@
       const prevEventBtn = document.getElementById('prev-event');
       const nextEventBtn = document.getElementById('next-event');
       const tlPopover = document.getElementById('tl-popover');
+      const eventMenu = document.getElementById('event-menu');
+      const eventMenuDelete = document.getElementById('event-menu-delete');
       const pitchPane = document.getElementById('pitch-pane');
       const footagePane = document.getElementById('footage-pane');
       const wideBtn = document.getElementById('wide');
@@ -1089,7 +1126,41 @@
         tagNote.value = '';
         tagStatus.textContent = `Tagged ${type} at ${clockText(tag.time_s)}`;
         drawTimeline(); // the marker shows now, faded, and solidifies when the store is acknowledged
-        Streamlit.setComponentValue({action: 'tag', tags: state.pendingTags.slice()});
+        postAction({action: 'tag', tags: state.pendingTags.slice(), deletes: state.pendingDeletes.slice()});
+      }
+
+      function eventIsPendingDelete(event) {
+        return (state.pendingDeletes || []).some((row) => row.index === event.index);
+      }
+
+      function sendDelete(event) {
+        // The marker names its row in the log (index) and the event it drew (type/team/source/recording/second);
+        // Python refuses a row whose position no longer holds that event, so a stale value cannot delete an
+        // unrelated marker. The marker is hidden immediately and comes back if the store reports a mismatch.
+        if (!state.data || !event || event.index === undefined || event.index === null) return;
+        const row = {
+          seq: ++state.deleteSeq,
+          index: Number(event.index),
+          type: String(event.type || ''),
+          team: Number(event.team === undefined || event.team === null ? -1 : event.team),
+          source: String(event.source || ''),
+          log_time_s: Number(event.log_time_s === undefined ? event.time_s : event.log_time_s),
+          video: String(event.video || ''),
+          player_track:
+            event.player_track === undefined || event.player_track === null ? null : Number(event.player_track),
+        };
+        state.pendingDeletes.push(row);
+        hideEventMenu();
+        hideEventPopover();
+        drawTimeline();
+        tagStatus.textContent = `Removed ${row.type} at ${clockText(event.time_s)}`;
+        postAction({action: 'delete', deletes: state.pendingDeletes.slice(), tags: state.pendingTags.slice()});
+      }
+
+      function postAction(value) {
+        // The only round trips are deliberate store gestures: a tag press and a timeline delete. Playback never
+        // posts - a value per gesture would be fine, a value per frame would re-render the whole page per frame.
+        Streamlit.setComponentValue(value);
       }
 
       function eventShapePath(x, y, type) {
@@ -1198,8 +1269,10 @@
 
         // event markers: every event on its own type's track, so a cluster no longer piles onto one spot. The
         // shape says the category (triangle offensive, square defensive, circle other); filled still means a
-        // manual tag and hollow a detected one, and the color stays the type's.
+        // manual tag and hollow a detected one, and the color stays the type's. A marker whose delete is on its
+        // way to Python is hidden now; a failed delete redraws it when the store is acknowledged.
         for (const event of state.events || []) {
+          if (eventIsPendingDelete(event)) continue;
           drawEventMarker(
             xOf(event.time_s), lanes.yOf(event.type), event.type, event.source === 'manual', eventColor(event.type), 1
           );
@@ -1239,6 +1312,7 @@
         let best = null;
         let bestDistance = 9; // the marker's radius plus a little slack for a steady hand
         for (const event of state.events) {
+          if (eventIsPendingDelete(event)) continue;
           const dx = timelineMarkerX(event.time_s, rect.width) - x;
           const dy = lanes.yOf(event.type) - y;
           const distance = Math.hypot(dx, dy);
@@ -1279,6 +1353,26 @@
         clearTimeout(popoverTimer);
         popoverTimer = null;
         tlPopover.style.display = 'none';
+      }
+
+      let menuEvent = null;
+
+      function hideEventMenu() {
+        menuEvent = null;
+        eventMenu.hidden = true;
+      }
+
+      function showEventMenu(event, clientX, clientY) {
+        // A marker's right-click menu: one action, but it names the event so the target is unmistakable. The
+        // box is fixed-position and clamped to the viewport, so it cannot be clipped by the strip or the page.
+        menuEvent = event;
+        eventMenuDelete.textContent = `Delete ${event.type} at ${clockText(event.time_s)}`;
+        eventMenu.hidden = false;
+        const width = eventMenu.offsetWidth;
+        const height = eventMenu.offsetHeight;
+        eventMenu.style.left = `${Math.min(Math.max(8, clientX), window.innerWidth - width - 8)}px`;
+        eventMenu.style.top = `${Math.min(Math.max(8, clientY), window.innerHeight - height - 8)}px`;
+        eventMenuDelete.focus({preventScroll: true});
       }
 
       function flashEventPopover(event) {
@@ -1836,6 +1930,30 @@
         else hideEventPopover();
       });
       tl.addEventListener('mouseleave', hideEventPopover);
+      tl.addEventListener('contextmenu', (event) => {
+        // Right-click only takes over on a marker; elsewhere the browser's own menu is left alone. The marker
+        // is also what the menu deletes, not wherever the pointer ends up after the menu opens.
+        const hit = eventAt(event.clientX, event.clientY);
+        if (!hit) {
+          hideEventMenu();
+          return;
+        }
+        event.preventDefault();
+        hideEventPopover();
+        showEventMenu(hit, event.clientX, event.clientY);
+      });
+      eventMenuDelete.addEventListener('click', () => sendDelete(menuEvent));
+      document.addEventListener('pointerdown', (event) => {
+        if (!eventMenu.hidden && !eventMenu.contains(event.target)) hideEventMenu();
+      });
+      document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+          hideEventMenu();
+          hideEventPopover();
+        }
+      });
+      window.addEventListener('scroll', hideEventMenu, true);
+      window.addEventListener('resize', hideEventMenu);
       scrub.addEventListener('input', () => {
         setPlaying(false);
         state.time = Number(scrub.value);
@@ -2008,6 +2126,12 @@
         const ackTagSeq = Number(args.ack_tag_seq || 0);
         if (ackTagSeq > 0) {
           state.pendingTags = state.pendingTags.filter((tag) => tag.seq > ackTagSeq);
+        }
+        // Deletes use the same acknowledgment: a marker Python stored away is already gone from ``args.events``;
+        // one it refused (stale position) is still there and is drawn again by the redraw below.
+        const ackDeleteSeq = Number(args.ack_delete_seq || 0);
+        if (ackDeleteSeq > 0) {
+          state.pendingDeletes = state.pendingDeletes.filter((row) => row.seq > ackDeleteSeq);
         }
         renderTagTeam(args.team_names);
         // The footage stream's whereabouts: the server's base URL (derived from this page's host and the port

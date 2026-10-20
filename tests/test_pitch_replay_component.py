@@ -2,8 +2,8 @@
 
 Like the annotation component, this is a static frontend read as a file. The checks exist because the interesting
 property is easy to lose: a playback control that round-trips to Python would re-render the whole page per frame.
-The one deliberate exception is the tag bar: a tag press is a discrete gesture whose whole point is to be stored,
-so it posts one value - with the playback's own second - and nothing else does.
+The two deliberate exceptions are the tag bar and a right-click delete on the strip: each is a discrete gesture
+whose whole point is to change the match's event log, so it posts one value and nothing else does.
 """
 
 from __future__ import annotations
@@ -18,16 +18,51 @@ COMPONENT = (
     / "pitch_replay_component"
     / "index.html"
 )
+APP = Path(__file__).resolve().parents[1] / "src" / "soccer_analytics" / "dashboard" / "app.py"
 
 
 def test_playback_controls_exist_and_run_locally() -> None:
     html = COMPONENT.read_text()
     assert 'id="play"' in html and 'id="scrub"' in html and "requestAnimationFrame" in html
     # Play/pause, stepping and scrubbing must not talk to Python: a component value per gesture (let alone per
-    # frame) would re-render the whole page. The one exception is a tag press, which is exactly the gesture that
-    # *should* be stored in the match's event log - so the single round trip in the file must sit in ``sendTag``.
-    assert html.count("Streamlit.setComponentValue(") == 1, "only the tag press may round-trip to Python"
+    # frame) would re-render the whole page. The two deliberate exceptions are store gestures - a tag press and
+    # a marker delete - and both go through the one ``postAction`` call, so the raw protocol call stays singular.
+    assert html.count("Streamlit.setComponentValue(") == 1, "only store gestures may round-trip to Python"
+    assert "function postAction(" in html
+    assert "postAction({action: 'tag'" in html
+    assert "postAction({action: 'delete'" in html
+    assert html.index("Streamlit.setComponentValue(") > html.index("function postAction(")
     assert html.index("Streamlit.setComponentValue(") > html.index("function sendTag(")
+    assert html.index("Streamlit.setComponentValue(") > html.index("function sendDelete(")
+
+
+def test_an_event_marker_can_be_deleted_by_right_click() -> None:
+    """The strip is a review queue: a right-click on one marker deletes that event, not a row chosen in a form.
+
+    The gesture must not fall through to the strip's seek click, must name the event it drew (position and
+    identity) rather than deleting whatever later occupies that position, and must use the same sequence +
+    acknowledgment contract as the tag bar so a sticky component value cannot hide a marker forever.
+    """
+    html = COMPONENT.read_text()
+    assert "addEventListener('contextmenu'" in html
+    assert "event.preventDefault()" in html.split("addEventListener('contextmenu'", 1)[1]
+    assert "function showEventMenu(" in html and 'id="event-menu-delete"' in html
+    assert "function sendDelete(" in html
+    send_delete = html.split("function sendDelete(", 1)[1]
+    for field in ("event.index", "event.log_time_s", "event.type", "event.source", "event.video"):
+        assert field in send_delete, f"a delete must carry {field} to prove the row it means"
+    assert "state.pendingDeletes" in send_delete
+    assert "args.ack_delete_seq" in html, "the acknowledgment is what clears a pending marker"
+    assert "state.pendingDeletes = state.pendingDeletes.filter" in html
+
+
+def test_the_strip_index_reaches_the_event_log_delete() -> None:
+    """The component can only name a log row if Python puts its index on the strip; the action must be handled."""
+    source = APP.read_text()
+    assert '"index": index' in source, "each strip event must carry its position in the event log"
+    assert '"log_time_s"' in source, "the delete matcher needs the recording second, not the strip second"
+    assert "ack_delete_seq=int(st.session_state.get(f\"replay_delete_ack" in source
+    assert "_apply_timeline_deletes(library, match_id, replay_action)" in source
 
 
 def test_the_tag_bar_offers_every_event_type_on_the_playback_second() -> None:

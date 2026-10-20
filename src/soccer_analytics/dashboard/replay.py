@@ -138,6 +138,49 @@ def repeated_manual_tag(
     return None
 
 
+def deleted_events(events: Sequence[Event], rows: Sequence[dict]) -> list[tuple[int, Event]]:
+    """The stored events a timeline delete gesture names, highest index first.
+
+    A right-click on the strip sends the marker's position in the event log plus the event's own identity. The
+    position alone is not enough: a sticky component value can arrive after another tab (or a scan) changed the
+    log, and deleting whatever now sits at that index would remove an unrelated event. Every row is therefore
+    checked against the stored event's type, team, source, recording and second; a mismatch is skipped. The
+    result is ordered highest-index first so removing several rows in one gesture cannot shift the others.
+    """
+    matched: dict[int, Event] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            index = int(row.get("index"))
+        except (TypeError, ValueError):
+            continue
+        if index in matched or not 0 <= index < len(events):
+            continue
+        event = events[index]
+        if str(row.get("type") or "") != event.type:
+            continue
+        if str(row.get("source") or "") != event.source:
+            continue
+        try:
+            if int(row.get("team", event.team)) != int(event.team):
+                continue
+        except (TypeError, ValueError):
+            continue
+        sent_time = row.get("log_time_s")
+        if sent_time is not None:
+            try:
+                if abs(float(sent_time) - float(event.time_s)) > 0.01:
+                    continue
+            except (TypeError, ValueError):
+                continue
+        sent_video = row.get("video")
+        if sent_video is not None and str(sent_video) != str(event.video):
+            continue
+        matched[index] = event
+    return sorted(matched.items(), key=lambda item: item[0], reverse=True)
+
+
 def _kit_color(entry: Sequence[int] | None) -> list[int] | None:
     """One team's kit color as a plain JSON list of three ints, or None when there is none to show.
 

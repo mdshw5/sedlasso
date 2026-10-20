@@ -117,6 +117,7 @@ from soccer_analytics.dashboard.reports import (
 from soccer_analytics.dashboard.replay import (
     aiming_goal,
     build_replay,
+    deleted_events,
     event_from_tag,
     event_play,
     player_table_rows,
@@ -372,6 +373,7 @@ def replay_view(
     seek_to_s: float | None = None,
     seek_seq: int = 0,
     ack_tag_seq: int = 0,
+    ack_delete_seq: int = 0,
 ) -> dict | None:
     """Draw the animated pitch view; playback lives entirely in the browser.
 
@@ -385,10 +387,11 @@ def replay_view(
     showing. ``seek_to_s`` plus ``seek_seq`` is the "jump to this moment" request from the picker above; the
     component acts when the sequence changes, so unrelated reruns never re-seek.
 
-    The component's tag buttons under the pitch post their tags back (the playback controls never round-trip), so
-    the return value is what they sent - ``{"action": "tag", "tags": [...]}`` - or None. ``ack_tag_seq`` is the
-    newest tag already stored; the component drops everything up to it, so a tag is neither lost nor stored
-    twice. Returns the value so the caller can store the new tags and redraw with them on the strip.
+    Two deliberate gestures post back (the playback controls never round-trip): the tag buttons under the pitch
+    send ``{"action": "tag", "tags": [...]}`` and a right-click delete on the strip sends
+    ``{"action": "delete", "deletes": [...]}``. The return value is what they sent, or None. ``ack_tag_seq`` and
+    ``ack_delete_seq`` are the newest gesture already stored; the component drops everything up to them, so a
+    gesture is neither lost nor applied twice. Returns the value so the caller can store it and redraw the strip.
     """
     return REPLAY_COMPONENT(
         data_url=data_url,
@@ -409,6 +412,7 @@ def replay_view(
         seek_to_s=seek_to_s,
         seek_seq=int(seek_seq),
         ack_tag_seq=int(ack_tag_seq),
+        ack_delete_seq=int(ack_delete_seq),
         key=key,
         default=None,
     )
@@ -434,14 +438,15 @@ def _apply_quick_tags(
     no acknowledgment to compare against - so the store is also idempotent: a press that is already on the
     timeline (same type, team, recording and second) is skipped rather than duplicated.
     """
-    if not isinstance(tag_result, dict) or str(tag_result.get("action")) != "tag":
+    if not isinstance(tag_result, dict):
+        return
+    tags = [tag for tag in (tag_result.get("tags") or []) if isinstance(tag, dict)]
+    if not tags:
         return
     ack_key = f"replay_tag_ack::{match_id}"
     newest = int(st.session_state.get(ack_key, 0))
     fresh: list[Event] = []
-    for tag in tag_result.get("tags") or []:
-        if not isinstance(tag, dict):
-            continue
+    for tag in tags:
         newest = max(newest, int(tag.get("seq") or 0))
         if int(tag.get("seq") or 0) <= int(st.session_state.get(ack_key, 0)):
             continue
@@ -482,6 +487,66 @@ def _apply_quick_tags(
             "A tag arrived in a shape the page could not read; it was skipped.",
         )
     # Rerun so the strip, the table and the acknowledged tag bar all see the stored event in this same gesture.
+    st.rerun()
+
+
+def _keep_event_pickers_valid(match_id: str, log, removed_indices: set[int]) -> None:
+    """Move the index-based event pickers onto the rows they still mean after a deletion."""
+    for key in (f"pitch_clip_event::{match_id}", f"event_remove::{match_id}"):
+        current = st.session_state.get(key)
+        if not isinstance(current, int):
+            continue
+        if current in removed_indices:
+            st.session_state[key] = min(current, len(log.events) - 1) if log.events else 0
+        else:
+            st.session_state[key] = current - sum(1 for index in removed_indices if index < current)
+    st.session_state[f"event_remove_confirm::{match_id}"] = False
+
+
+def _apply_timeline_deletes(library: MatchLibrary, match_id: str, result) -> None:
+    """Delete the markers a right-click on the timeline strip named, then redraw without them.
+
+    The strip's component value is sticky, so every delete carries a sequence number and this page acknowledges
+    the newest one it handled - the same contract as the tag bar. The acknowledgment is written even when a row
+    no longer matches the log (another tab may have changed it); otherwise the strip would keep hiding a marker
+    that is still stored. The rows themselves carry the event's identity, not just its position, because a
+    position can point at a different event by the time the round trip lands.
+    """
+    if not isinstance(result, dict):
+        return
+    rows = [row for row in (result.get("deletes") or []) if isinstance(row, dict)]
+    if not rows:
+        return
+    ack_key = f"replay_delete_ack::{match_id}"
+    newest = int(st.session_state.get(ack_key, 0))
+    for row in rows:
+        try:
+            newest = max(newest, int(row.get("seq") or 0))
+        except (TypeError, ValueError):
+            continue
+    if newest <= int(st.session_state.get(ack_key, 0)):
+        return  # nothing new: the sticky value was already handled on an earlier run
+    st.session_state[ack_key] = newest
+    log = library.events(match_id)
+    removed = deleted_events(log.events, rows)
+    if not removed:
+        st.session_state["events_flash"] = (
+            "warning",
+            "That event is not on the timeline any more - it may have been removed in another tab.",
+        )
+        st.rerun()
+        return
+    for index, _event in removed:
+        log.remove(index)
+    library.save_events(match_id, log)
+    _keep_event_pickers_valid(match_id, log, {index for index, _event in removed})
+    if len(removed) == 1:
+        event = removed[0][1]
+        message = f"Removed {event.type} at {_clock(event.time_s)} from the timeline."
+    else:
+        message = f"Removed {len(removed)} events from the timeline."
+    st.session_state["events_flash"] = ("success", message)
+    # Rerun so the strip, the table and any open picker all see the deletion in the same gesture.
     st.rerun()
 
 
@@ -2050,7 +2115,7 @@ def replay_section(
         half_minute = game_record_for_video.bounds()[1] / 60.0
     window_start = float(segment.meta.get("start_s", 0.0))
     strip_events: list[dict] = []
-    for event in event_log.events:
+    for index, event in enumerate(event_log.events):
         # The strip's clock is the analyzed window's own (0 at its first frame), so an event's time is translated
         # out of its recording's clock onto the game's and then onto the window's. One helper does the first step,
         # so the strip, the table and the half labels cannot disagree.
@@ -2064,7 +2129,16 @@ def replay_section(
         strip_t = on_game - window_start
         if strip_t < -1.0 or strip_t > float(replay.get("duration_s", 0.0)) + 1.0:
             continue  # a moment from another recording that is not part of this analyzed window
-        strip_events.append({**event.to_json(), "time_s": round(max(0.0, strip_t), 3)})
+        strip_events.append(
+            {
+                **event.to_json(),
+                # ``time_s`` is the strip's clock; the log's own second rides along so a right-click delete can
+                # prove the row it names is still the row the marker described.
+                "time_s": round(max(0.0, strip_t), 3),
+                "index": index,
+                "log_time_s": round(float(event.time_s), 3),
+            }
+        )
     strip_half_minute = None
     if half_minute is not None:
         strip_half_minute = half_minute * 60.0 - window_start
@@ -2104,7 +2178,7 @@ def replay_section(
             st.session_state["replay_flash"] = ("success", f"Footage stream starting on port {stream_port}.")
 
         st.button("Start the footage stream", key=f"start_stream::{match_id}", on_click=_start_stream)
-    tag_result = replay_view(
+    replay_action = replay_view(
         _replay_media_url(replay_path),
         numbers,
         selected,
@@ -2120,10 +2194,12 @@ def replay_section(
         seek_to_s=seek_to_s,
         seek_seq=seek_seq,
         ack_tag_seq=int(st.session_state.get(f"replay_tag_ack::{match_id}", 0)),
+        ack_delete_seq=int(st.session_state.get(f"replay_delete_ack::{match_id}", 0)),
     )
-    # A button in the tag bar under the pitch posts its tag back with the playback's own second; storing it is a
-    # rerun away from the strip carrying the new marker, so the tag lands and the page redraws in one gesture.
-    _apply_quick_tags(library, match_id, video, window_start, float(replay.get("duration_s", 0.0)), tag_result)
+    # Two gestures write to the event log: a tag from the bar under the pitch (stamped with the playback's own
+    # second) and a right-click delete on the strip. Both redraw in the same gesture via a rerun.
+    _apply_timeline_deletes(library, match_id, replay_action)
+    _apply_quick_tags(library, match_id, video, window_start, float(replay.get("duration_s", 0.0)), replay_action)
     has_ball = any(entry is not None for entry in (replay.get("ball") or []))
     excluded = int(replay.get("bystanders_excluded") or 0)
     st.caption(
@@ -2385,15 +2461,7 @@ def events_section(
             )
             return
         library.save_events(match_id, log)
-        for key in (f"pitch_clip_event::{match_id}", f"event_remove::{match_id}"):
-            current = st.session_state.get(key)
-            if not isinstance(current, int):
-                continue
-            if current > int(index):
-                st.session_state[key] = current - 1
-            elif current == int(index):
-                st.session_state[key] = min(int(index), len(log.events) - 1) if log.events else 0
-        st.session_state[f"event_remove_confirm::{match_id}"] = False
+        _keep_event_pickers_valid(match_id, log, {int(index)})
         st.session_state["events_flash"] = (
             "success",
             f"Removed {removed.type} at {_clock(removed.time_s)} from the timeline.",
@@ -2505,8 +2573,9 @@ def events_section(
         )
         with st.expander("Remove an individual event", expanded=False):
             st.caption(
-                "Deletes one row from `events.json`: a manual tag is gone until you tag it again, and a detected "
-                "candidate can come back if the detector is run again. This cannot be undone."
+                "The fastest way is the timeline strip above: right-click any marker to delete it. This form is "
+                "for deleting one row from `events.json` by name - a manual tag is gone until you tag it again, "
+                "and a detected candidate can come back if the detector is run again. This cannot be undone."
             )
             remove_index = st.selectbox(
                 "Event to remove",

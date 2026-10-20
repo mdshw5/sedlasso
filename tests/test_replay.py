@@ -11,9 +11,11 @@ import pytest
 
 from soccer_analytics.analysis import stage_b
 from soccer_analytics.analysis.projection import project_ball_track, project_segment, segment_poses
+from soccer_analytics.analysis.events import Event
 from soccer_analytics.dashboard.replay import (
     aiming_goal,
     build_replay,
+    deleted_events,
     event_from_tag,
     event_play,
     player_table_rows,
@@ -541,3 +543,50 @@ def test_a_re_delivered_press_is_recognized_as_already_stored() -> None:
     tackle = Event(time_s=552.5, type="tackle", team=0, video="/v.mp4")
     late_tackle = Event(time_s=554.0, type="tackle", team=0, video="/v.mp4")
     assert repeated_manual_tag([tackle], late_tackle) is None
+
+
+def test_a_timeline_delete_matches_the_marker_it_names() -> None:
+    """A right-click delete carries the marker's log position and its identity - and both must agree.
+
+    The position is how the log is edited; the identity is what keeps a stale component value from deleting
+    whatever moved into that slot after another tab's change. Detected candidates are deletable too: the strip
+    is the review queue, and a wrong candidate has to be removable from it.
+    """
+    events = [
+        Event(time_s=10.0, type="goal", team=0, source="manual", video="/v.mp4"),
+        Event(time_s=20.0, type="shot", team=1, source="ball", video="/v.mp4"),
+        Event(time_s=30.0, type="tackle", team=0, source="ball", video="/v.mp4"),
+    ]
+    rows = [
+        {"index": 0, "type": "goal", "team": 0, "source": "manual", "log_time_s": 10.0, "video": "/v.mp4"},
+        {"index": 1, "type": "shot", "team": 1, "source": "ball", "log_time_s": 20.0, "video": "/v.mp4"},
+    ]
+    assert [(index, event.type) for index, event in deleted_events(events, rows)] == [(1, "shot"), (0, "goal")]
+
+
+def test_a_timeline_delete_skips_a_stale_position() -> None:
+    """If the log changed under the component, the index can point at a different event; nothing is deleted."""
+    events = [
+        Event(time_s=10.0, type="goal", team=0, source="manual", video="/v.mp4"),
+        Event(time_s=20.0, type="shot", team=1, source="ball", video="/v.mp4"),
+    ]
+    stale = [
+        {"index": 0, "type": "shot", "team": 1, "source": "ball", "log_time_s": 20.0, "video": "/v.mp4"},
+        {"index": 9, "type": "shot", "team": 1, "source": "ball", "log_time_s": 20.0, "video": "/v.mp4"},
+        {"index": 1, "type": "shot", "team": 0, "source": "ball", "log_time_s": 20.0, "video": "/v.mp4"},
+        {"index": 1, "type": "shot", "team": 1, "source": "ball", "log_time_s": 21.0, "video": "/v.mp4"},
+        {"index": 1, "type": "shot", "team": 1, "source": "ball", "log_time_s": 20.0, "video": "/other.mp4"},
+        "not a row",
+    ]
+    assert deleted_events(events, stale) == []
+
+
+def test_a_timeline_delete_of_several_markers_removes_highest_first() -> None:
+    """Two right-clicks can arrive together; deleting the higher index first keeps the lower one valid."""
+    events = [Event(time_s=float(index), type="other", team=0, source="manual") for index in range(4)]
+    rows = [
+        {"index": 1, "type": "other", "team": 0, "source": "manual", "log_time_s": 1.0, "video": ""},
+        {"index": 3, "type": "other", "team": 0, "source": "manual", "log_time_s": 3.0, "video": ""},
+        {"index": 3, "type": "other", "team": 0, "source": "manual", "log_time_s": 3.0, "video": ""},
+    ]
+    assert [index for index, _event in deleted_events(events, rows)] == [3, 1]
