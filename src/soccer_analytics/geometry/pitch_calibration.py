@@ -90,6 +90,12 @@ class PitchCalibration:
     # poses is 24 m off at the median. The field lets the app notice the mismatch and refit rather than project
     # through a stale pose.
     pose_source: str = "chain"
+    # The pan axis/yaw-scale model the calibration was fitted through (see gimbal_motion.PanModel). The physical
+    # prior assumes a plumb mast; a real 4 m mast is often rolled or tilted, and that error depends on heading, so
+    # it is not something the time-based drift correction can absorb. Storing the fitted model here keeps the
+    # calibration and the camera path it was solved against together; the segment also keeps a sidecar copy so a
+    # rebuild that reads only the segment still projects through the same axis.
+    pan_model: dict | None = None
 
     def to_json(self) -> dict:
         payload = {
@@ -106,6 +112,8 @@ class PitchCalibration:
         }
         if self.drift is not None:
             payload["drift"] = self.drift.to_json()
+        if self.pan_model is not None:
+            payload["pan_model"] = dict(self.pan_model)
         return payload
 
     @classmethod
@@ -122,7 +130,19 @@ class PitchCalibration:
             bool(data.get("ill_conditioned", False)),
             DriftCorrection.from_json(data["drift"]) if data.get("drift") else None,
             str(data.get("pose_source", "chain")),
+            dict(data["pan_model"]) if data.get("pan_model") else None,
         )
+
+    def pan_axis_model(self):
+        """The saved :class:`gimbal_motion.PanModel`, or ``None`` for a calibration fitted without one."""
+        if not self.pan_model:
+            return None
+        from soccer_analytics.geometry.gimbal_motion import PanModel  # noqa: PLC0415 - avoids an import cycle
+
+        try:
+            return PanModel.from_json(self.pan_model)
+        except (KeyError, TypeError, ValueError):
+            return None
 
     def corrected_chain(self, q: np.ndarray) -> np.ndarray:
         """The chain with this calibration's drift correction applied (itself when there is none)."""

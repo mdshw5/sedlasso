@@ -14,6 +14,7 @@ import pytest
 
 from soccer_analytics.geometry.gimbal_log import GimbalFrame, load_gimbal_logs, parse_gimbal_log
 from soccer_analytics.geometry.gimbal_motion import (
+    PAN_MODEL_FILE,
     PanModel,
     _GAME_MANIFEST_CACHE,
     _clips_for_segment,
@@ -21,7 +22,9 @@ from soccer_analytics.geometry.gimbal_motion import (
     align_log,
     find_logs_for_clips,
     fit_pan_model,
+    load_pan_model,
     log_orientation,
+    save_pan_model,
     segment_has_log,
 )
 
@@ -213,6 +216,42 @@ def test_the_yaw_scale_is_not_dragged_down_by_windows_that_rotated_off_axis() ->
     assert model.scale == pytest.approx(1.0, abs=0.03), (
         "off-axis windows must be screened out of the scale fit"
     )
+
+
+def test_pan_model_with_angles_rolls_tilts_and_scales() -> None:
+    """The 3-DOF neighborhood really moves the axis in the two directions it promises."""
+    base = PanModel(
+        axis=np.array([0.0, np.sin(np.radians(78.4)), np.cos(np.radians(78.4))]),
+        scale=1.0,
+        yaw0=0.0,
+        rms_deg=0.0,
+        samples=1,
+    )
+    rolled = base.with_angles(3.0, 0.0)
+    assert abs(rolled.axis[0]) > 0.05, "roll must put the axis off the image's vertical plane"
+    assert np.isclose(np.linalg.norm(rolled.axis), 1.0)
+
+    tilted = base.with_angles(0.0, 2.0)
+    angle = np.degrees(np.arccos(np.clip(base.axis @ tilted.axis, -1.0, 1.0)))
+    assert angle == pytest.approx(2.0, abs=0.05)
+
+    scaled = base.with_angles(0.0, 0.0, 0.05)
+    assert scaled.scale == pytest.approx(1.05)
+    assert np.allclose(scaled.axis, base.axis)
+
+
+def test_pan_model_sidecar_round_trips(tmp_path: Path) -> None:
+    """A fitted model saved beside a segment is read back without touching the match archive."""
+    from types import SimpleNamespace
+
+    segment = SimpleNamespace(directory=tmp_path)
+    model = PanModel(np.array([0.02, 0.98, 0.2]), 1.07, 3.9, 0.4, 12)
+    path = save_pan_model(segment, model)
+    assert path is not None and path.name == PAN_MODEL_FILE and path.exists()
+    restored = load_pan_model(segment)
+    assert restored is not None
+    assert np.allclose(restored.axis, model.axis)
+    assert restored.scale == pytest.approx(model.scale)
 
 
 def test_log_orientation_holds_through_a_gap() -> None:

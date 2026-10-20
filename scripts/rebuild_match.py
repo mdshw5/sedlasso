@@ -77,7 +77,7 @@ def main() -> int:
 
     started = time.time()
     segment = load_segment(segment_dir)
-    q, focal = segment_poses(segment)
+    q, focal = segment_poses(segment, pan_model=calibration.pan_axis_model())
     print(f"loaded {segment_dir.name} ({time.time() - started:.0f}s)", flush=True)
 
     detections = project_segment(segment, calibration, poses=(q, focal))

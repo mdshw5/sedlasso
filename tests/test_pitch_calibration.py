@@ -460,6 +460,26 @@ def test_calibration_round_trips_through_json() -> None:
     assert again.residuals_m == cal.residuals_m
 
 
+def test_calibration_round_trips_the_fitted_pan_model() -> None:
+    landmarks, chain = _clicks({0: 0.0, 1: 35.0})
+    model = {
+        "axis": [0.02, 0.98, 0.2],
+        "scale": 1.07,
+        "yaw0": 3.9,
+        "rms_deg": 0.4,
+        "samples": 12,
+    }
+    cal = calibrate(landmarks, chain, ASPECT)
+    stored = PitchCalibration.from_json({**cal.to_json(), "pan_model": model})
+    assert stored.pan_model == model
+    restored = stored.pan_axis_model()
+    assert restored is not None
+    assert np.allclose(restored.axis, model["axis"])
+    assert restored.scale == pytest.approx(model["scale"])
+    # The default state - a calibration fitted before the 3-DOF fit existed - stays readable.
+    assert PitchCalibration.from_json(cal.to_json()).pan_axis_model() is None
+
+
 def test_calibration_records_its_pose_source() -> None:
     landmarks, chain = _clicks({0: 0.0, 1: 35.0})
     assert calibrate(landmarks, chain, ASPECT).pose_source == "chain"

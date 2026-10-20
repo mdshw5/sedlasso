@@ -27,6 +27,7 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -72,10 +73,21 @@ from soccer_analytics.analysis.library import (
 )
 from soccer_analytics.analysis.kit import color_hex, color_name, suggest_team_name
 from soccer_analytics.analysis.jerseys import merge_numbers
-from soccer_analytics.analysis.projection import project_ball_track, project_segment, segment_poses
+from soccer_analytics.analysis.projection import (
+    fit_segment_pan_axis,
+    project_ball_track,
+    project_segment,
+    segment_poses,
+)
 from soccer_analytics.analysis.rosters import RosterLibrary, team_rosters_for
 from soccer_analytics.analysis.stage_a import SegmentConfig, load_segment, read_status, resolve_window, segment_dir_for
-from soccer_analytics.geometry.gimbal_motion import segment_has_log, segment_pose_source
+from soccer_analytics.geometry.gimbal_motion import (
+    load_pan_model,
+    save_pan_model,
+    segment_has_log,
+    segment_pose_source,
+)
+from soccer_analytics.geometry.pitch_lines import LineObservation, observations_to_landmarks
 from soccer_analytics.geometry.pitch_markings import markings_for, with_goal_width
 from soccer_analytics.dashboard.pitch_clicks import (
     actual_center,
@@ -1167,10 +1179,11 @@ def probe_cached(video: str):  # noqa: ANN201 - VideoProbe, kept out of the impo
 
 
 def segment_fingerprint(segment_dir: Path, chunks: int) -> str:
-    """Cache key for a segment's contents: it changes when meta, status or the set of chunks changes."""
+    """Cache key for a segment's contents: it changes when meta, status, the pan model or the chunks change."""
     meta_mtime = (segment_dir / "meta.json").stat().st_mtime_ns if (segment_dir / "meta.json").exists() else 0
     status_mtime = (segment_dir / "status.json").stat().st_mtime_ns if (segment_dir / "status.json").exists() else 0
-    return f"{meta_mtime}-{status_mtime}-{chunks}"
+    pan_mtime = (segment_dir / "pan_model.json").stat().st_mtime_ns if (segment_dir / "pan_model.json").exists() else 0
+    return f"{meta_mtime}-{status_mtime}-{pan_mtime}-{chunks}"
 
 
 @st.cache_resource(show_spinner=False, max_entries=2)
@@ -1332,6 +1345,104 @@ def saved_calibration(
     return library.load_calibration(match_id)
 
 
+def line_landmarks_for_match(library: MatchLibrary, match_id: str) -> list:
+    """Cached automatic line observations for this match, or an empty list when the scan has not run.
+
+    The scan itself is a whole-video decode, so it is run offline (``scripts/fit_pan_axis.py --detect-lines``) and
+    cached beside the match. The dashboard fit only consumes the cache; a missing cache simply means the fit uses
+    the clicks alone.
+    """
+    path = library.path(match_id) / "line_observations.json"
+    if not path.exists():
+        return []
+    try:
+        rows = json.loads(path.read_text())
+        observations = [
+            LineObservation(
+                frame=int(row["frame"]),
+                u=float(row["u"]),
+                v=float(row["v"]),
+                pitch_x=float(row["pitch_x"]),
+                pitch_y=float(row["pitch_y"]),
+                direction=tuple(float(v) for v in row["direction"]),
+                label=str(row.get("label", "line")),
+                contrast=float(row.get("contrast", 0.0)),
+            )
+            for row in rows
+        ]
+        return observations_to_landmarks(observations)
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+
+
+def fit_pan_axis_from_clicks(
+    library: MatchLibrary,
+    match_id: str,
+    segment,
+    labeled: list[tuple[dict, str]],
+    land_table: dict[str, tuple[float, float]],
+    length_m: float,
+    width_m: float,
+    source: str | None = None,
+):
+    """Fit the 3-DOF tripod axis, refit the calibration through it, and save both.
+
+    This is the slow, explicit action: the search solves a camera for each candidate axis, so it takes minutes on
+    a whole game. It uses the cached line observations when they exist and the clicks otherwise. Returns
+    ``(calibration, fit)`` or ``None`` when the segment has no log / the ground control cannot place a camera.
+    """
+    landmarks = landmarks_from_points(labeled, land_table)
+    all_landmarks = landmarks + line_landmarks_for_match(library, match_id)
+    progress = st.progress(0.0, text="Fitting the tripod pan axis...")
+
+    def report(fraction: float) -> None:
+        progress.progress(
+            min(0.99, max(0.0, float(fraction))),
+            text=f"Fitting the tripod pan axis... {int(min(1.0, max(0.0, fraction)) * 100)}%",
+        )
+
+    try:
+        result = fit_segment_pan_axis(
+            segment, all_landmarks, fixed_height_m=CAMERA_HEIGHT_M, on_progress=report
+        )
+    except Exception as exc:  # noqa: BLE001 - reported on the page
+        st.session_state["calib_fit_error"] = f"{type(exc).__name__}: {exc}"
+        return None
+    if result is None:
+        st.session_state["calib_fit_error"] = (
+            "the tripod-axis fit could not place a camera through these landmarks (or this segment has no "
+            "gimbal log). The saved calibration was left unchanged."
+        )
+        return None
+    calibration, _q_model, _focal_model, fit = result
+    save_pan_model(segment, fit.model)
+    clicks = [{"frame": lm.frame, "u": lm.u, "v": lm.v, "label": lm.label} for lm in landmarks]
+    click_count = len(landmarks)
+    excluded_clicks = {index for index in calibration.excluded if index < click_count}
+    click_rms = float(
+        np.sqrt(
+            np.mean(
+                [
+                    residual
+                    for index, residual in enumerate(calibration.residuals_m[:click_count])
+                    if index not in excluded_clicks
+                ]
+                or [0.0]
+            )
+        )
+    )
+    st.session_state["calib_axis_message"] = (
+        f"Tripod axis fitted: click RMS {click_rms:.2f} m (trimmed fit RMS {fit.rms_m:.2f} m). "
+        "The projection now uses the fitted axis."
+    )
+    st.session_state["calibration"] = calibration.to_json()
+    st.session_state["calib_landmarks"] = clicks
+    library.save_calibration(match_id, calibration)
+    library.save_clicks(match_id, clicks, (length_m, width_m), source=source)
+    progress.progress(1.0, text="Tripod pan axis fitted.")
+    return calibration, fit
+
+
 def fit_from_clicks(
     library: MatchLibrary,
     match_id: str,
@@ -1359,11 +1470,19 @@ def fit_from_clicks(
         calibration = calibrate(
             landmarks, chain, segment.aspect, pose_source=segment_pose_source(segment), fixed_height_m=CAMERA_HEIGHT_M
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - reported on the page
         # Keep the cause for the page: one generic sentence hid real bugs behind "check the labels" - the solver
         # saying *why* it failed is the difference between a five-minute fix and a hunt.
         st.session_state["calib_fit_error"] = f"{type(exc).__name__}: {exc}"
         return None
+    # A 3-DOF axis fit belongs to the segment, not to one click set: a later re-label or re-click must not throw it
+    # away. The q the caller passed already comes from the sidecar (segment_and_poses_cached keys on its mtime), so
+    # preserving the model here keeps the calibration and the camera path describing the same camera.
+    if load_pan_model(segment) is not None:
+        existing = st.session_state.get("calibration")
+        previous = PitchCalibration.from_json(existing) if existing else library.load_calibration(match_id)
+        if previous is not None and previous.pan_model:
+            calibration = replace(calibration, pan_model=previous.pan_model)
     # A fit that cannot be reconciled must never replace a good saved calibration. Restoring a click set against
     # the wrong recording (or a mislabeled set) produces a wildly wrong but numerically "successful" solve; saving
     # it would destroy the calibration that was working. Keep the previous calibration on disk and report the
@@ -3581,7 +3700,10 @@ if segment is not None:
     # new session, and the whole point of the saved set is to outlive the browser tab. Frames are indices into the
     # segment they were clicked on, so a set from another segment is refused (restored_points) rather than
     # renumbered into nonsense.
-    clicks_key = f"{match_id}|{chosen}|{format_name}|{length_m:.3f}|{width_m:.3f}"
+    # Bump the version when the restore rules change: a running page keeps its session state across reruns, so a
+    # stale (empty) set would otherwise stay empty until the user switched matches. v2 re-resolves saved sources
+    # against the footage root, which is what makes a moved archive's clicks visible again.
+    clicks_key = f"v2|{match_id}|{chosen}|{format_name}|{length_m:.3f}|{width_m:.3f}"
     if st.session_state.get("calib_clicks_key") != clicks_key:
         saved_clicks = library.load_clicks(match_id)
         saved_source = library.load_clicks_source(match_id)
@@ -3944,6 +4066,13 @@ are sure of.
     ordered = order_clicks(stored)
     labeled: list[tuple[dict, str]] = []
     display_duplicates: list[str] = []
+    if ordered:
+        clicked_frames = {int(point["frame"]) for point in ordered}
+        st.caption(
+            f"{len(ordered)} saved landmark click(s) on {len(clicked_frames)} frame(s). The magnified view draws "
+            "only the clicks on the frame it is showing; use a frame button in **Landmark clicks** to jump to "
+            "one, or scrub to that frame."
+        )
 
     # Callbacks run before the next run's body, so the list below is already rebuilt without the click. Doing the
     # work inline instead would need a st.rerun() to redraw it, which is a second full run for one button. They are
@@ -4109,6 +4238,9 @@ are sure of.
     dropped_note = st.session_state.pop("calib_dropped_note", "")
     if dropped_note:
         st.info(dropped_note)
+    axis_note = st.session_state.pop("calib_axis_message", "")
+    if axis_note:
+        st.success(axis_note)
     if display_duplicates:
         st.warning(
             "Two clicks are measured as the same landmark on one frame: " + ", ".join(display_duplicates)
@@ -4150,6 +4282,27 @@ are sure of.
                 st.success(fit_message(calibration, labeled))
     with clear_col:
         st.button("Clear all clicks", on_click=_clear_clicks)
+
+    # The tripod is a real, imperfect structure: its true pan axis is a little rolled/tilted relative to the
+    # gimbal's physical prior, and that error depends on heading. This is the explicit, slow action that fits it
+    # from the clicks and any cached line observations; the ordinary calibrate button stays seconds-fast.
+    axis_col, _axis_spacer = st.columns([2, 1])
+    with axis_col:
+        if st.button(
+            "Fit tripod axis (slow)",
+            disabled=len(labeled) < 4 or segment is None or not segment_has_log(segment),
+            help="Fit the camera's true pan axis (roll/tilt/yaw scale) to these clicks and any cached white-line "
+                 "observations, then refit the calibration through it. This removes a heading-dependent overlay "
+                 "shift that a time-based drift correction cannot. Takes minutes on a whole game; run the "
+                 "line-scan script first for the most stable fit.",
+        ):
+            fitted = fit_pan_axis_from_clicks(
+                library, match_id, segment, labeled, land_table, length_m, width_m, source=chosen
+            )
+            if fitted is None:
+                st.error(calibration_failure())
+            else:
+                st.rerun()
 
     calibration = saved_calibration(library, match_id, expected_source=analysis_source)
     if calibration is not None:

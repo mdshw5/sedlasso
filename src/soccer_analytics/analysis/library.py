@@ -480,9 +480,15 @@ class MatchLibrary:
         except (OSError, json.JSONDecodeError):
             record = None
         if record is not None:
+            # The record's sources are stored relative to the footage folder (``analysis/<id>/game.json``), not
+            # to the process's working directory, so a bare ``Path(candidate).exists()`` says no even when the
+            # file is right where it should be. Resolve them against the footage root the match directory sits
+            # in - the same base the missing stored path is resolved against below.
+            footage_root = directory.parent.parent
             for candidate in record.sources:
-                if Path(candidate).name == Path(stored).name and Path(candidate).exists():
-                    return str(candidate)
+                resolved = Path(resolve_path(candidate, footage_root))
+                if resolved.name == Path(stored).name and resolved.exists():
+                    return str(resolved)
         return resolve_path(stored, directory.parent.parent)
 
     def load_clicks_pitch(self, match_id: str) -> tuple[float, float] | None:

@@ -521,6 +521,7 @@ class SegmentData:
     det_conf: np.ndarray  # (D,)
     det_kit: np.ndarray  # (D, DESCRIPTOR_SIZE)
     det_track: np.ndarray  # (D,) BoT-SORT identity, -1 where the tracker had none (v1 chunks, or a fresh track)
+    directory: Path | None = None  # where the segment's chunks live (set by load_segment; None for hand-built data)
 
     @property
     def aspect(self) -> float:
@@ -574,4 +575,4 @@ def load_segment(directory: str | Path) -> SegmentData:
                 parts[key].append(value + offset if key == "det_frame" else value)
             offset += len(data["time"])
     joined = {k: np.concatenate(v) if v else np.empty(0) for k, v in parts.items()}
-    return SegmentData(meta=meta, **joined)
+    return SegmentData(meta=meta, **joined, directory=directory.resolve())

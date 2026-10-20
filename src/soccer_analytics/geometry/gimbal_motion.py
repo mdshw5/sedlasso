@@ -32,6 +32,7 @@ the parts where a mistake is invisible downstream, so they are tested against th
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,6 +55,30 @@ MIN_AXIS_SAMPLES = 30  # below this the fit is not trusted and the caller should
 # almost nothing about the yaw channel, and projecting it onto the axis under-counts - these windows dragged the
 # median from ~1.0 down to 0.70 on the reference game, which under-rotated every projection by 30%.
 AXIS_ALIGNMENT_COS = 0.99
+
+# The physical prior is a pan about world vertical with the camera tilted down. A mast that is not plumb, or a
+# head that is rolled, puts the true axis somewhere else in the camera frame - and that error is a function of the
+# *yaw*, so a time-based drift correction cannot remove it. The fit below searches a small neighborhood of the
+# physical axis: roll (camera x), tilt (camera y/z), and the yaw scale. Eight degrees and twenty percent cover a
+# 4 m mast on uneven ground with room to spare while keeping a stray click from moving the camera somewhere
+# unphysical.
+PAN_FIT_ROLL_DEG = 8.0
+PAN_FIT_TILT_DEG = 8.0
+PAN_FIT_SCALE = 0.20
+# The objective trims this fraction of the worst landmarks. A weighted fit would let one mislabeled far-side click
+# bend the axis; trimming keeps the fit on the clicks/lines that agree with each other and is what makes the fit
+# usable when a few of the saved clicks are wrong.
+PAN_FIT_TRIM = 0.15
+# Clicks alone cannot separate a yaw-scale error from a focal-length error: a few percent of each trades almost
+# exactly against the other, and a handful of mislabeled far-side clicks can pull the pair a long way. The first
+# line scan showed the same failure from the other side - observations detected near a biased prediction pulled the
+# scale to a visibly over-rotated overlay - so the scale stays regularized toward the chain-derived prior. Roll and
+# tilt remain free to follow the ground control.
+PAN_FIT_SCALE_PRIOR = 100.0  # meters of objective per unit of squared scale delta
+# Line observations can number in the thousands; the axis is a three-parameter model, so a spread sample carries
+# the same information at a fraction of the solve cost.
+PAN_FIT_MAX_LINES = 40
+PAN_MODEL_FILE = "pan_model.json"
 
 
 @dataclass(frozen=True)
@@ -89,6 +114,25 @@ class PanModel:
             yaw0=float(data["yaw0"]),
             rms_deg=float(data["rms_deg"]),
             samples=int(data["samples"]),
+        )
+
+    def with_angles(self, roll_deg: float, tilt_deg: float, scale_delta: float = 0.0) -> "PanModel":
+        """A nearby model with the pan axis rolled/tilted and the yaw scale shifted.
+
+        ``roll_deg`` rotates the axis about the camera's optical axis (what a mast that is not plumb or a head that
+        is not level does to a nominally vertical pan), and ``tilt_deg`` rotates it in the camera's vertical plane
+        (the physical tilt prior being slightly wrong). Both are expressed in the reference frame of ``self``.
+        """
+        axis = self.axis / np.linalg.norm(self.axis)
+        tilt = cv2.Rodrigues(np.radians(float(tilt_deg)) * np.array([1.0, 0.0, 0.0]))[0]
+        roll = cv2.Rodrigues(np.radians(float(roll_deg)) * np.array([0.0, 0.0, 1.0]))[0]
+        axis = roll @ (tilt @ axis)
+        return PanModel(
+            axis=axis / np.linalg.norm(axis),
+            scale=float(self.scale + scale_delta),
+            yaw0=float(self.yaw0),
+            rms_deg=float(self.rms_deg),
+            samples=int(self.samples),
         )
 
 
@@ -236,33 +280,151 @@ def _median_pitch(pitch: np.ndarray | None, yaw: np.ndarray) -> float | None:
     return 0.0
 
 
+@dataclass(frozen=True)
+class PanAxisFit:
+    """The result of :func:`fit_pan_axis`: the refined model and how well it matches the ground control."""
+
+    model: PanModel
+    rms_m: float  # trimmed RMS of the landmarks the fit used, in ground meters
+    evaluations: int
+
+
+def fit_pan_axis(
+    model: PanModel,
+    yaw: np.ndarray,
+    landmarks,
+    focal: np.ndarray,
+    aspect: float,
+    *,
+    fixed_height_m: float | None = None,
+    max_lines: int = PAN_FIT_MAX_LINES,
+    on_progress=None,
+) -> PanAxisFit:
+    """Fit the pan axis and yaw scale to clicks and automatic line observations.
+
+    The physical prior (a vertical pan axis at the logged tilt) is only right if the mast is plumb and the head is
+    level. A 4 m mast on grass is often neither: the camera's true pan axis is rolled or tilted in its own frame,
+    and because that error depends on the camera's *heading*, the time-based drift correction cannot remove it -
+    clicks at one heading fit and clicks at another are rejected as outliers. The same is true of the yaw scale:
+    a five-percent error is invisible near the middle of the pan and meters at its ends.
+
+    This searches a bounded roll/tilt/scale neighborhood around ``model``, minimizing a trimmed calibration
+    residual over both the user's clicks and any line observations supplied. Only the camera's *pointing* model
+    changes; the base pose and focal scale are refitted by the caller with the returned model. Trimming means a
+    handful of mislabeled clicks or a misdetected line cannot drag the axis somewhere unphysical, while the
+    surviving landmarks still constrain it.
+
+    Returns the original model (with its cost) when there is too little ground control or the solver cannot place
+    a camera through it. The search is deliberately small and deterministic - this runs on a saved calibration,
+    not per frame - and never replaces the physical prior with a free 3-DOF camera.
+    """
+    if len(landmarks) < 6:
+        return PanAxisFit(model, float("nan"), 0)
+
+    sample = _pan_fit_sample(landmarks, max_lines=max_lines)
+    cache: dict[tuple[float, float, float], float] = {}
+    evaluations = 0
+    budget = 90.0
+
+    def report() -> None:
+        if on_progress is not None:
+            on_progress(min(0.99, evaluations / budget))
+
+    def cost(roll: float, tilt: float, scale_delta: float) -> float:
+        nonlocal evaluations
+        key = (round(roll, 5), round(tilt, 5), round(scale_delta, 6))
+        if key in cache:
+            return cache[key]
+        evaluations += 1
+        candidate = model.with_angles(roll, tilt, scale_delta)
+        q = log_orientation(yaw, candidate)
+        chain = {lm.frame: (q[lm.frame], float(focal[lm.frame])) for lm in sample}
+        try:
+            from soccer_analytics.geometry.pitch_calibration import calibrate  # noqa: PLC0415 - avoids an import cycle
+
+            calibration = calibrate(
+                sample,
+                chain,
+                aspect,
+                correct_drift=False,
+                reject_outliers=False,
+                robust=True,
+                fixed_height_m=fixed_height_m,
+                pose_source="log",
+            )
+        except Exception:  # noqa: BLE001 - a candidate that cannot place a camera is simply not an improvement
+            cache[key] = float("inf")
+            report()
+            return float("inf")
+        errors = np.asarray(calibration.residuals_m, dtype=np.float64)
+        keep = max(4, int(round(len(errors) * (1.0 - PAN_FIT_TRIM))))
+        value = float(np.sqrt(np.mean(np.sort(errors)[:keep] ** 2)))
+        cache[key] = value
+        report()
+        return value
+
+    def score(roll: float, tilt: float, scale_delta: float) -> tuple[float, float]:
+        rms = cost(roll, tilt, scale_delta)
+        if not np.isfinite(rms):
+            return float("inf"), rms
+        return rms + PAN_FIT_SCALE_PRIOR * float(scale_delta) ** 2, rms
+
+    best_score, best_rms = score(0.0, 0.0, 0.0)
+    if not np.isfinite(best_score):
+        return PanAxisFit(model, float("nan"), evaluations)
+    best = (0.0, 0.0, 0.0)  # roll, tilt, scale delta
+
+    # Coordinate descent with a couple of diagonal moves: tilt and scale are correlated (both trade far-side
+    # height against near-side width), so axis-aligned steps alone can crawl along the valley instead of down it.
+    for step in (2.0, 1.0, 0.5, 0.25):
+        step_scale = step / 100.0
+        for _ in range(8):
+            r0, t0, s0 = best
+            neighbours = [
+                (r0 + step, t0, s0),
+                (r0 - step, t0, s0),
+                (r0, t0 + step, s0),
+                (r0, t0 - step, s0),
+                (r0, t0, s0 + step_scale),
+                (r0, t0, s0 - step_scale),
+                (r0 + step, t0 + step, s0 + step_scale),
+                (r0 - step, t0 - step, s0 - step_scale),
+            ]
+            improved = False
+            for roll, tilt, delta in neighbours:
+                if abs(roll) > PAN_FIT_ROLL_DEG or abs(tilt) > PAN_FIT_TILT_DEG or abs(delta) > PAN_FIT_SCALE:
+                    continue
+                value, rms = score(roll, tilt, delta)
+                if value < best_score - 1e-6:
+                    best_score, best_rms, best = value, rms, (roll, tilt, delta)
+                    improved = True
+            if not improved:
+                break
+    return PanAxisFit(model.with_angles(*best), best_rms, evaluations)
+
+
+def _pan_fit_sample(landmarks, *, max_lines: int) -> list:
+    """Clicks plus a spread sample of line observations, so a thousands-of-lines scan does not dominate."""
+    clicks = [lm for lm in landmarks if getattr(lm, "direction", None) is None]
+    lines = [lm for lm in landmarks if getattr(lm, "direction", None) is not None]
+    if len(lines) > max_lines > 0:
+        indices = np.linspace(0, len(lines) - 1, max_lines).round().astype(int)
+        lines = [lines[i] for i in indices]
+    return clicks + lines
+
+
 def refine_pan_model(
     model: PanModel,
     yaw: np.ndarray,
     landmarks,
     focal: np.ndarray,
     aspect: float,
+    *,
+    fixed_height_m: float | None = None,
 ) -> PanModel:
-    """Refine the pan axis and scale against landmark clicks, when the user's clicks are trusted.
-
-    The physical axis and the chain-derived scale are a good prior, but the clicks are the only *absolute* ground
-    control. This makes one coarse sweep over a small neighborhood of the axis tilt and the scale, keeping any
-    move that lowers the click residual, so it can adjust the model but never replace it with a different camera.
-    Returns the original model unchanged when there are too few clicks to constrain it.
-    """
-    if len(landmarks) < 6:
-        return model
-    best = model
-    best_rms = _click_rms(best, yaw, landmarks, focal, aspect)
-    if best_rms is None:
-        return model
-    for d_pitch in (-2.0, -1.0, -0.5, 0.5, 1.0, 2.0):
-        for d_scale in (-0.04, -0.02, 0.02, 0.04):
-            candidate = _perturb(best, d_pitch, d_scale)
-            rms = _click_rms(candidate, yaw, landmarks, focal, aspect)
-            if rms is not None and rms < best_rms - 1e-4:
-                best, best_rms = candidate, rms
-    return best
+    """Compatibility wrapper around :func:`fit_pan_axis`; returns the model unchanged when it cannot be fitted."""
+    fit = fit_pan_axis(model, yaw, landmarks, focal, aspect, fixed_height_m=fixed_height_m)
+    return fit.model if np.isfinite(fit.rms_m) else model
 
 
 def _perturb(model: PanModel, d_pitch_deg: float, d_scale: float) -> PanModel:
@@ -382,15 +544,18 @@ def build_log_poses(
     fps: float,
     landmarks=None,
     aspect: float | None = None,
+    pan_model: PanModel | None = None,
+    fixed_height_m: float | None = None,
 ) -> tuple[np.ndarray, PanModel, dict[str, np.ndarray]] | None:
     """The whole log pipeline: find the logs, align them, fit the pan model, and return the orientation.
 
     Returns ``(Q, model, aligned)`` where ``Q`` is the per-frame orientation to use in place of the chain's,
-    ``model`` is the fitted pan model (for the record), and ``aligned`` carries the per-frame yaw/pitch/zoom/lock
-    the log supplied. Returns ``None`` when there is no log for these clips, so the caller keeps the chain.
+    ``model`` is the pan model (for the record), and ``aligned`` carries the per-frame yaw/pitch/zoom/lock the log
+    supplied. Returns ``None`` when there is no log for these clips, so the caller keeps the chain.
 
-    ``landmarks`` (the user's clicks) are optional: when given, the pan model is refined against them, which is the
-    only absolute ground control. Without them the physical axis and the chain-derived scale are used as-is.
+    ``pan_model`` is a model already fitted against absolute ground control (see :func:`fit_pan_axis`). When it is
+    given it is used as-is; otherwise the physical prior is fitted from the chain, and ``landmarks`` (clicks and
+    line observations) refine it when supplied. ``fixed_height_m`` is the rig height for that refinement.
     """
     pairs = find_logs_for_clips(clip_paths)
     if pairs is None:
@@ -398,11 +563,16 @@ def build_log_poses(
     # ``find_logs_for_clips`` returns the logs in clip order; the clip start times come from the game manifest.
     logs = [(load_gimbal_log(path), float(start)) for (path, _), start in zip(pairs, clip_starts)]
     aligned = align_log(logs, start_s=start_s, fps=fps, frame_count=len(chain_q))
-    model = fit_pan_model(chain_q, ok, aligned["yaw"], aligned["pitch"])
-    if model is None:
-        return None
-    if landmarks is not None and aspect is not None:
-        model = refine_pan_model(model, aligned["yaw"], landmarks, focal, aspect)
+    if pan_model is None:
+        model = fit_pan_model(chain_q, ok, aligned["yaw"], aligned["pitch"])
+        if model is None:
+            return None
+        if landmarks is not None and aspect is not None:
+            model = refine_pan_model(
+                model, aligned["yaw"], landmarks, focal, aspect, fixed_height_m=fixed_height_m
+            )
+    else:
+        model = pan_model
     return log_orientation(aligned["yaw"], model), model, aligned
 
 
@@ -547,6 +717,8 @@ def log_poses_for_segment(
     focal: np.ndarray,
     *,
     landmarks=None,
+    pan_model: PanModel | None = None,
+    fixed_height_m: float | None = None,
 ) -> tuple[np.ndarray, PanModel, dict[str, np.ndarray]] | None:
     """Log-backed orientation for a segment, or ``None`` when its footage has no gimbal log.
 
@@ -554,11 +726,17 @@ def log_poses_for_segment(
     carry the logs, and the clip start seconds place them on the analysis clock. Everything is best-effort: a
     missing manifest, a missing log directory, or a log that does not cover the segment all return ``None`` so the
     caller keeps the estimated chain.
+
+    A saved ``pan_model`` (the per-segment sidecar written by :func:`save_pan_model`) wins over the physical prior;
+    it is the one fitted to absolute ground control. An explicit ``pan_model`` argument wins over the sidecar, so a
+    caller holding a calibration can be sure it projects through the model that calibration was fitted against.
     """
     clip_paths, clip_starts = _clips_for_segment(segment)
     # A segment without the clock fields (a synthetic or hand-built one) has no log to align to; keep the chain.
     if "start_s" not in segment.meta or "fps" not in segment.meta:
         return None
+    if pan_model is None:
+        pan_model = load_pan_model(segment)
     return build_log_poses(
         clip_paths,
         clip_starts,
@@ -569,6 +747,62 @@ def log_poses_for_segment(
         fps=float(segment.meta["fps"]),
         landmarks=landmarks,
         aspect=segment.aspect,
+        pan_model=pan_model,
+        fixed_height_m=fixed_height_m,
+    )
+
+
+def load_pan_model(segment) -> PanModel | None:
+    """The saved pan model for a segment's own footage, or ``None`` when it has not been fitted.
+
+    The model lives beside the segment's chunks rather than in the match record: it belongs to the camera path
+    (the segment), and every consumer that rebuilds poses - the dashboard, the stream, the report rebuild - should
+    pick it up without having to know which match archive is open. A malformed sidecar is ignored rather than
+    taking the page down; the physical prior is a safe fallback.
+    """
+    directory = getattr(segment, "directory", None)
+    if directory is None:
+        return None
+    path = Path(directory) / PAN_MODEL_FILE
+    if not path.exists():
+        return None
+    try:
+        return PanModel.from_json(json.loads(path.read_text()))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def save_pan_model(segment, model: PanModel) -> Path | None:
+    """Write a fitted pan model beside the segment's chunks; returns the path (``None`` when it has no directory)."""
+    directory = getattr(segment, "directory", None)
+    if directory is None:
+        return None
+    path = Path(directory) / PAN_MODEL_FILE
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_text(json.dumps(model.to_json(), indent=2))
+    temp.replace(path)
+    return path
+
+
+def aligned_log_for_segment(segment) -> dict[str, np.ndarray] | None:
+    """The segment's gimbal log sampled on its own analysis clock, or ``None`` when it has no log.
+
+    This is the alignment without the pose fit: the yaw/pitch/zoom the log supplied at each frame. A caller that
+    already has ground control (clicks, line observations) can fit a pan model directly from it instead of first
+    fitting one to the visual chain.
+    """
+    if "start_s" not in segment.meta or "fps" not in segment.meta:
+        return None
+    clip_paths, clip_starts = _clips_for_segment(segment)
+    pairs = find_logs_for_clips(clip_paths)
+    if pairs is None:
+        return None
+    logs = [(load_gimbal_log(path), float(start)) for (path, _), start in zip(pairs, clip_starts)]
+    return align_log(
+        logs,
+        start_s=float(segment.meta["start_s"]),
+        fps=float(segment.meta["fps"]),
+        frame_count=len(segment.time),
     )
 
 

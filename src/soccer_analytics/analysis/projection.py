@@ -9,14 +9,27 @@ positions instead of silently treating them as exact.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
 from soccer_analytics.analysis.stage_a import SegmentData
 from soccer_analytics.geometry.camera_motion import integrate_poses, smooth_pose_chain
-from soccer_analytics.geometry.gimbal_motion import log_poses_for_segment
-from soccer_analytics.geometry.pitch_calibration import PitchCalibration, pitch_to_pixels, pixels_to_pitch
+from soccer_analytics.geometry.gimbal_motion import (
+    PanAxisFit,
+    PanModel,
+    aligned_log_for_segment,
+    fit_pan_axis,
+    fit_pan_model,
+    log_orientation,
+    log_poses_for_segment,
+)
+from soccer_analytics.geometry.pitch_calibration import (
+    PitchCalibration,
+    calibrate,
+    pitch_to_pixels,
+    pixels_to_pitch,
+)
 
 # Typical foot-point localization error of a YOLO box bottom edge, in pixels at 1920 wide. Players' feet are not
 # always inside the box tightly (running poses, occlusion), so this is deliberately not 1.
@@ -54,7 +67,12 @@ class PitchDetections:
     camera_xy: np.ndarray
 
 
-def segment_poses(segment: SegmentData, focal0: float | None = None) -> tuple[np.ndarray, np.ndarray]:
+def segment_poses(
+    segment: SegmentData,
+    focal0: float | None = None,
+    *,
+    pan_model: PanModel | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """Per-frame ``Q`` and focal for a segment, rebuilt from stored raw steps (lost frames carry no motion).
 
     When the requested ``focal0`` is the one the analysis pass used (the default), the stored per-frame focal
@@ -66,6 +84,11 @@ def segment_poses(segment: SegmentData, focal0: float | None = None) -> tuple[np
     of the chain: the log records the yaw the camera actually commanded, so it does not accumulate the drift the
     chain does. The focal still comes from the chain, because the log's zoom step has no published mapping to focal
     length and the calibration solves a focal scale from the clicks anyway. A segment with no log keeps the chain.
+
+    ``pan_model`` overrides the model fitted from the chain's own steps. A saved calibration carries the model it
+    was fitted against (tilt/roll/yaw-scale from the clicks and lines), and projecting through any other model
+    would move the whole pitch relative to that calibration - so callers holding a calibration should pass it.
+    When it is omitted, a per-segment ``pan_model.json`` sidecar is used if present.
     """
     default_focal = float(segment.meta["default_focal"])
     focal0 = default_focal if focal0 is None else focal0
@@ -73,7 +96,7 @@ def segment_poses(segment: SegmentData, focal0: float | None = None) -> tuple[np
     known = np.asarray(segment.focal, dtype=np.float64) if abs(float(focal0) - default_focal) < 1e-9 else None
     q, focal = integrate_poses(steps, focal0, segment.aspect, known_focals=known)
     if abs(float(focal0) - default_focal) < 1e-9:
-        logged = log_poses_for_segment(segment, q, focal)
+        logged = log_poses_for_segment(segment, q, focal, pan_model=pan_model)
         if logged is not None:
             # The logged orientation is absolute and drift-free but quantized: it holds for a few frames and then
             # steps, and every projected player and pitch marking jumps with it. A zero-phase filter removes the
@@ -83,6 +106,83 @@ def segment_poses(segment: SegmentData, focal0: float | None = None) -> tuple[np
             # chain, whose steps are already smooth optical-flow measurements.
             q, focal = smooth_pose_chain(logged[0], focal, float(segment.meta["fps"]))
     return q, focal
+
+
+# The axis fit itself needs only a spread sample of line observations, but the final camera solve benefits from
+# more of them. Cap the final set too: a line scan can produce thousands, and the calibration is a least-squares
+# solve whose cost grows superlinearly with the landmark count.
+PAN_CALIBRATION_LINES = 200
+
+
+def _calibration_landmarks(landmarks, max_lines: int = PAN_CALIBRATION_LINES) -> list:
+    """Clicks plus a spread sample of line observations, for the final camera solve."""
+    clicks = [lm for lm in landmarks if getattr(lm, "direction", None) is None]
+    lines = [lm for lm in landmarks if getattr(lm, "direction", None) is not None]
+    if len(lines) > max_lines:
+        indices = np.linspace(0, len(lines) - 1, max_lines).round().astype(int)
+        lines = [lines[i] for i in indices]
+    return clicks + lines
+
+
+def fit_segment_pan_axis(
+    segment: SegmentData,
+    landmarks,
+    *,
+    fixed_height_m: float | None = None,
+    max_lines: int | None = None,
+    on_progress=None,
+) -> tuple[PitchCalibration, np.ndarray, np.ndarray, PanAxisFit] | None:
+    """Fit the 3-DOF pan axis and a calibration through it, from clicks and line observations.
+
+    This is the one place the fit is assembled: build the visual chain, take the log's yaw track, fit the
+    roll/tilt/yaw-scale neighborhood around the physical prior, smooth the resulting orientation the same way the
+    projection does, and solve the base camera pose through it. Returns ``None`` when the segment has no log or
+    the ground control cannot place a camera, so a caller can fall back to the old calibration instead of losing
+    it. The caller decides whether to save the returned calibration and the model sidecar.
+    """
+    aligned = aligned_log_for_segment(segment)
+    if aligned is None:
+        return None
+    steps = [None if (not ok or i == 0) else step for i, (ok, step) in enumerate(zip(segment.ok, segment.step))]
+    q_chain, focal = integrate_poses(
+        steps,
+        float(segment.meta["default_focal"]),
+        segment.aspect,
+        known_focals=np.asarray(segment.focal, dtype=np.float64),
+    )
+    base = fit_pan_model(q_chain, segment.ok, aligned["yaw"], aligned["pitch"])
+    if base is None:
+        return None
+    fit_kwargs = {} if max_lines is None else {"max_lines": max_lines}
+    fit = fit_pan_axis(
+        base,
+        aligned["yaw"],
+        landmarks,
+        focal,
+        segment.aspect,
+        fixed_height_m=fixed_height_m,
+        on_progress=on_progress,
+        **fit_kwargs,
+    )
+    if not np.isfinite(fit.rms_m):
+        return None
+    q_model = log_orientation(aligned["yaw"], fit.model)
+    q_model, focal_model = smooth_pose_chain(q_model, focal, float(segment.meta["fps"]))
+    solve_landmarks = _calibration_landmarks(landmarks)
+    chain = {lm.frame: (q_model[lm.frame], float(focal_model[lm.frame])) for lm in solve_landmarks}
+    try:
+        calibration = calibrate(
+            solve_landmarks,
+            chain,
+            segment.aspect,
+            correct_drift=True,
+            fixed_height_m=fixed_height_m,
+            pose_source="log",
+        )
+    except Exception:  # noqa: BLE001 - a ground-control set that cannot place a camera is not a usable fit
+        return None
+    calibration = replace(calibration, pan_model=fit.model.to_json())
+    return calibration, q_model, focal_model, fit
 
 
 def project_segment(
@@ -95,7 +195,9 @@ def project_segment(
 ) -> PitchDetections:
     """Map every detection to pitch meters. If ``pitch_size=(length, width)`` is given, nothing is clipped here;
     use ``on_pitch_mask`` to decide who is a player. ``on_progress(fraction)`` is called a few times per run."""
-    q, focal = poses if poses is not None else segment_poses(segment)
+    q, focal = poses if poses is not None else segment_poses(
+        segment, pan_model=calibration.pan_axis_model()
+    )
     # The calibration's drift correction belongs to the chain, not to the caller's copy of it: every projection in
     # the app goes through here, so applying it centrally is what keeps the report, the replay and the fit check
     # all looking at the same (corrected) camera path.

@@ -123,18 +123,26 @@ def _grab_sampled_frames(segment, frames: list[int], width: int = 960) -> dict[i
     """One streaming decode pass, keeping only the sampled frames.
 
     A per-frame ffmpeg spawn costs ~2 s of startup each; a single pass at the analysis rate costs a few minutes
-    for a whole game and serves every sampled frame. The reader starts at 0.0 and steps 1/fps, which is exactly
-    the analysis clock, so reader frame ``i`` is analysis frame ``i``.
+    for a whole game and serves every sampled frame. The reader seeks to the first wanted frame and steps at
+    ``1/fps``, which is exactly the analysis clock, so reader frame ``i`` is analysis frame ``first + i``. Seeking
+    matters for a windowed scan: a ten-minute window over a whole game then decodes ten minutes, not the whole
+    game.
     """
     from soccer_analytics.ingest.source import open_reader
 
+    if not frames:
+        return {}
     wanted = set(frames)
+    first = min(wanted)
+    last = max(wanted)
+    fps = float(segment.meta["fps"])
     out: dict[int, np.ndarray] = {}
-    reader = open_reader(segment.meta["video"], fps=float(segment.meta["fps"]), width=width)
+    reader = open_reader(segment.meta["video"], fps=fps, width=width, start_s=first / fps)
     for index, (_t, frame) in enumerate(reader.frames()):
-        if index in wanted:
-            out[index] = frame
-        if index >= max(wanted):
+        actual = first + index
+        if actual in wanted:
+            out[actual] = frame
+        if actual >= last:
             break
     return out
 
@@ -149,6 +157,8 @@ def detect_line_observations(
     width_m: float,
     stride: int = LINE_STRIDE,
     max_pan_deg_per_frame: float = MAX_PAN_DEG_PER_FRAME,
+    start_frame: int = 0,
+    end_frame: int | None = None,
     on_progress=None,
 ) -> list[LineObservation]:
     """Scan sampled frames for white-line crossings near the predicted markings.
@@ -158,9 +168,14 @@ def detect_line_observations(
     direction-constrained observation: the pitch point is the *predicted* midpoint of the marking (the detection
     only measures across the line, so the along-line coordinate stays the prediction's), and ``direction`` is
     the predicted line's image normal.
+
+    ``start_frame``/``end_frame`` restrict the scan to a window, which is how a whole-game decode is avoided when
+    fitting the pan axis from a few representative passages; the default is the whole segment.
     """
     pan = _pan_rates(segment, len(q))
-    sampled = [f for f in range(0, len(q), stride) if pan[f] <= max_pan_deg_per_frame]
+    stop = len(q) if end_frame is None else min(len(q), max(0, end_frame))
+    start = max(0, min(len(q), start_frame))
+    sampled = [f for f in range(start, stop, stride) if pan[f] <= max_pan_deg_per_frame]
     images = _grab_sampled_frames(segment, sampled)
     segments = pitch_marking_lines(length_m, width_m)
 

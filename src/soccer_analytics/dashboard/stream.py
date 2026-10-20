@@ -624,7 +624,7 @@ class AnnotatedMatch:
         if not meta_path.exists():
             raise StreamError(f"segment not found for {match_id}: {segment_dir}")
         segment = load_segment(segment_dir)
-        q, focal = segment_poses(segment)
+        q, focal = segment_poses(segment, pan_model=calibration.pan_axis_model())
 
         teams = {int(p["track_id"]): int(p["team"]) for p in replay["players"]}
         numbers, jerseys = load_numbers(

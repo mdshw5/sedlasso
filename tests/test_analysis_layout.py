@@ -200,6 +200,28 @@ def test_saved_clicks_follow_a_moved_game_manifest(footage_root: Path, tmp_path:
     )
 
 
+def test_saved_clicks_resolve_a_relative_match_source(footage_root: Path, tmp_path: Path) -> None:
+    """A moved archive whose match record names its manifest relatively still restores its clicks.
+
+    ``match.json`` stores sources relative to the footage folder (``analysis/<id>/game.json``), so checking the
+    raw string against the process's working directory always misses even when the file exists. The library must
+    resolve the source against the footage root before deciding it is a different recording.
+    """
+    video = _fake_video(footage_root / "2026-10-03" / "16:28:37.784.MP4", size=100)
+    library = MatchLibrary()
+    record = library.create(video)
+    directory = library.path(record.match_id)
+    manifest = directory.parent / "2026-10-03_other_game" / "game.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(json.dumps({"game_id": "other", "output": "game.mp4", "duration_s": 1.0, "clips": []}))
+    record.sources = [f"analysis/{manifest.parent.name}/game.json"]
+    library.save(record)
+    clicks_path = directory / "clicks.json"
+    old = tmp_path / "old" / "2026-10-03" / "analysis" / manifest.parent.name / "game.json"
+    clicks_path.write_text(json.dumps({"clicks": [], "pitch": [60.0, 40.0], "source": str(old)}))
+    assert library.load_clicks_source(record.match_id) == str(manifest)
+
+
 def test_a_game_manifest_sits_in_the_combined_videos_analysis_directory(footage_root: Path) -> None:
     first = _fake_video(footage_root / "2026-10-03" / "16:28:37.784.MP4", size=100)
     second = _fake_video(footage_root / "2026-10-03" / "16:58:38.391.MP4", size=200)
