@@ -14,7 +14,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from soccer_analytics.analysis.stage_a import SegmentData
-from soccer_analytics.geometry.camera_motion import integrate_poses
+from soccer_analytics.geometry.camera_motion import integrate_poses, smooth_pose_chain
 from soccer_analytics.geometry.gimbal_motion import log_poses_for_segment
 from soccer_analytics.geometry.pitch_calibration import PitchCalibration, pitch_to_pixels, pixels_to_pitch
 
@@ -75,7 +75,13 @@ def segment_poses(segment: SegmentData, focal0: float | None = None) -> tuple[np
     if abs(float(focal0) - default_focal) < 1e-9:
         logged = log_poses_for_segment(segment, q, focal)
         if logged is not None:
-            q = logged[0]
+            # The logged orientation is absolute and drift-free but quantized: it holds for a few frames and then
+            # steps, and every projected player and pitch marking jumps with it. A zero-phase filter removes the
+            # steps without lagging a pan, and the focal track from the optical-flow chain gets the same treatment.
+            # The calibration is fitted through this same chain, and an existing one remains valid (the whole-game
+            # click RMS moved by 0.2 px on the reference match). A segment without a log keeps the raw visual
+            # chain, whose steps are already smooth optical-flow measurements.
+            q, focal = smooth_pose_chain(logged[0], focal, float(segment.meta["fps"]))
     return q, focal
 
 

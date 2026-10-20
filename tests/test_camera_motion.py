@@ -6,10 +6,15 @@ The scene is a distant textured plane on a wide image; frames are rendered by wa
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import cv2
 import numpy as np
 import pytest
+from scipy.spatial.transform import Rotation
 
+from soccer_analytics.analysis import projection
+from soccer_analytics.analysis.projection import segment_poses
 from soccer_analytics.geometry.camera_motion import (
     DEFAULT_FOCAL,
     CameraMotionTracker,
@@ -20,6 +25,7 @@ from soccer_analytics.geometry.camera_motion import (
     intrinsics,
     normalizer,
     overlay_mask,
+    smooth_pose_chain,
     step_is_plausible,
     to_reference,
 )
@@ -207,3 +213,107 @@ def test_rotation_chain_to_reference_is_identity_at_start() -> None:
     assert np.allclose(chain.to_ref, np.eye(3))
     assert np.allclose(to_reference(np.eye(3), F0, F0, ASPECT), np.eye(3))
     assert np.allclose(normalizer(W) @ np.linalg.inv(normalizer(W)), np.eye(3))
+
+
+def _pan_series(angles_deg: np.ndarray) -> np.ndarray:
+    """Rotations about the image vertical, the axis a pan moves about in this model."""
+    vectors = np.column_stack([np.zeros(len(angles_deg)), np.zeros(len(angles_deg)), np.radians(angles_deg)])
+    return Rotation.from_rotvec(vectors).as_matrix()
+
+
+def _rotation_error_deg(first: np.ndarray, second: np.ndarray) -> np.ndarray:
+    cosine = (np.einsum("fij,fij->f", first, second) - 1.0) / 2.0
+    return np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
+
+
+def test_pose_smoothing_removes_quantized_yaw_steps_without_lagging() -> None:
+    """A logged yaw that holds and then jumps is the jitter seen in the projected markings and players.
+
+    The filter must remove the steps while still following the ideal pan - a smoother that lags would trade
+    a jump for a trail, which is the problem this is meant to fix.
+    """
+    fps = 15.0
+    times = np.arange(0.0, 12.0, 1.0 / fps)
+    ideal = 8.0 * times  # a constant 8 deg/s pan
+    quantized = np.round(ideal / 2.0) * 2.0  # the log's 2-degree yaw steps
+    q = _pan_series(quantized)
+    focal = np.full(len(times), 0.82)
+    smooth, smooth_focal = smooth_pose_chain(q, focal, fps)
+    assert np.allclose(smooth_focal, focal)
+
+    ideal_q = _pan_series(ideal)
+    raw_error = _rotation_error_deg(q, ideal_q)
+    smooth_error = _rotation_error_deg(smooth, ideal_q)
+    assert np.max(smooth_error) < np.max(raw_error) * 0.75
+    # Zero phase: the smoothed angle follows the ideal pan instead of trailing it.
+    angles = np.degrees(Rotation.from_matrix(smooth).as_euler("xyz")[:, 2])
+    lag = angles - ideal
+    assert abs(float(np.mean(lag))) < 0.15
+    assert abs(float(lag[-1])) < 0.2
+    # The high-frequency part is what the eye sees as jitter.
+    raw_jitter = np.abs(np.diff(raw_error, n=2))
+    smooth_jitter = np.abs(np.diff(smooth_error, n=2))
+    assert np.percentile(smooth_jitter, 95) < np.percentile(raw_jitter, 95) * 0.5
+
+
+def test_pose_smoothing_preserves_a_constant_pan_and_zoom() -> None:
+    """Second-order filtering is exact for constant velocity: no reshape of real camera motion."""
+    fps = 15.0
+    times = np.arange(0.0, 8.0, 1.0 / fps)
+    q = _pan_series(3.0 * times)
+    focal = 0.82 * np.exp(0.002 * times)
+    smooth, smooth_focal = smooth_pose_chain(q, focal, fps)
+    assert np.max(_rotation_error_deg(smooth, q)) < 1e-3
+    assert np.allclose(smooth_focal, focal, rtol=1e-6)
+
+
+def test_pose_smoothing_reduces_focal_jitter() -> None:
+    """The focal comes from the optical-flow chain; alternating estimator noise must not move the markings."""
+    fps = 15.0
+    times = np.arange(0.0, 10.0, 1.0 / fps)
+    rng = np.random.default_rng(7)
+    ideal = 0.82 * np.exp(0.001 * times)
+    jittery = ideal * np.exp(rng.normal(0.0, 0.004, len(times)))
+    q = _pan_series(2.0 * times)
+    _smooth_q, smooth_focal = smooth_pose_chain(q, jittery, fps)
+    assert np.std(np.diff(np.log(smooth_focal))) < np.std(np.diff(np.log(jittery))) * 0.5
+    assert abs(float(np.mean(np.log(smooth_focal) - np.log(ideal)))) < 0.001
+
+
+def test_a_short_or_malformed_chain_is_left_alone() -> None:
+    q = _pan_series(np.array([0.0, 1.0, 2.0, 3.0]))
+    focal = np.full(4, 0.82)
+    smooth, smooth_focal = smooth_pose_chain(q, focal, 15.0)
+    assert np.array_equal(smooth, q) and np.array_equal(smooth_focal, focal)
+    with pytest.raises(ValueError):
+        smooth_pose_chain(q, focal[:2], 15.0)
+    with pytest.raises(ValueError):
+        smooth_pose_chain(q, focal, 0.0)
+
+
+def test_segment_poses_projects_through_a_smoothed_chain(monkeypatch) -> None:
+    """The projection and the stream both read segment_poses; the smoothing has to happen there, not in one caller."""
+    fps, frames = 15.0, 120
+    times = np.arange(frames) / fps
+    raw_q = _pan_series(4.0 * times)
+    stepped_q = _pan_series(np.round(4.0 * times))  # what a quantized log contributes when it holds and steps
+    focal = np.full(frames, 0.82)
+    segment = SimpleNamespace(
+        ok=np.ones(frames, dtype=bool),
+        step=[None] + [np.eye(3)] * (frames - 1),
+        focal=focal,
+        aspect=9 / 16,
+        meta={"default_focal": 0.82, "fps": fps},
+    )
+    monkeypatch.setattr(projection, "integrate_poses", lambda *args, **kwargs: (raw_q.copy(), focal.copy()))
+    monkeypatch.setattr(projection, "log_poses_for_segment", lambda *args, **kwargs: (stepped_q, None, {}))
+
+    q, _focal = segment_poses(segment)
+
+    def jitter(series: np.ndarray) -> float:
+        angles = np.degrees(Rotation.from_matrix(series).as_euler("xyz")[:, 2])
+        return float(np.mean(np.abs(np.diff(angles, n=2))))
+
+    assert jitter(q) < jitter(stepped_q) * 0.5
+    assert not np.allclose(q, stepped_q), "the stepped log must actually be filtered"
+    assert not np.allclose(q, raw_q), "the log orientation is the one projected, not the raw chain"

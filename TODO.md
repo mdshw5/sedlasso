@@ -5,6 +5,9 @@
 - [x] Add a small yellow whistle indicator in the scoreboard
 - [x] Add an indicator for half 1 / half 2 in the scoreboard
 - [x] Add an option to export saves in the highlight reels section
+- [x] Make homography-driven field lines more stable and keep them in sync with the optical-flow video motion
+  (zero-phase smoothing of the log-backed pose and optical-flow focal chain, used by projections, the pitch
+  animation and the stream overlay)
 
 ## Remaining
-- [ ] Make homography-driven field lines more stable and keep them in sync with the optical-flow video motion.
+Nothing currently.
