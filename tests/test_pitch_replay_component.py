@@ -63,6 +63,10 @@ def test_the_strip_index_reaches_the_event_log_delete() -> None:
     assert '"log_time_s"' in source, "the delete matcher needs the recording second, not the strip second"
     assert "ack_delete_seq=int(st.session_state.get(f\"replay_delete_ack" in source
     assert "_apply_timeline_deletes(library, match_id, replay_action)" in source
+    # The picker's widget exists before the delete is handled (Streamlit forbids writing its key mid-run), so the
+    # repair has to be queued and applied at the start of the next run, before the widget is created again.
+    assert 'f"event_reindex::{match_id}"' in source
+    assert "_apply_event_picker_repair(match_id)" in source
 
 
 def test_the_tag_bar_offers_every_event_type_on_the_playback_second() -> None:

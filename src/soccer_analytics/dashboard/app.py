@@ -490,17 +490,36 @@ def _apply_quick_tags(
     st.rerun()
 
 
-def _keep_event_pickers_valid(match_id: str, log, removed_indices: set[int]) -> None:
+def _reindex_event_pickers(match_id: str, removed_indices: set[int], remaining: int) -> None:
     """Move the index-based event pickers onto the rows they still mean after a deletion."""
     for key in (f"pitch_clip_event::{match_id}", f"event_remove::{match_id}"):
         current = st.session_state.get(key)
         if not isinstance(current, int):
             continue
         if current in removed_indices:
-            st.session_state[key] = min(current, len(log.events) - 1) if log.events else 0
+            st.session_state[key] = min(current, remaining - 1) if remaining else 0
         else:
             st.session_state[key] = current - sum(1 for index in removed_indices if index < current)
     st.session_state[f"event_remove_confirm::{match_id}"] = False
+
+
+def _keep_event_pickers_valid(match_id: str, log, removed_indices: set[int]) -> None:
+    """Repair the pickers from a widget callback, where their keys may still be written."""
+    _reindex_event_pickers(match_id, removed_indices, len(log.events))
+
+
+def _apply_event_picker_repair(match_id: str) -> None:
+    """Apply a repair queued by a deletion made mid-run, before the pickers are created.
+
+    A timeline delete is handled while the page is rendering, after ``pitch_clip_event`` has already been
+    instantiated - Streamlit refuses a write to that key then. The delete queues the indices instead, and the
+    rerun applies them here, at the top of the replay section and before either picker exists.
+    """
+    pending = st.session_state.pop(f"event_reindex::{match_id}", None)
+    if not pending:
+        return
+    removed = {int(index) for index in pending.get("removed") or ()}
+    _reindex_event_pickers(match_id, removed, max(0, int(pending.get("remaining") or 0)))
 
 
 def _apply_timeline_deletes(library: MatchLibrary, match_id: str, result) -> None:
@@ -539,7 +558,12 @@ def _apply_timeline_deletes(library: MatchLibrary, match_id: str, result) -> Non
     for index, _event in removed:
         log.remove(index)
     library.save_events(match_id, log)
-    _keep_event_pickers_valid(match_id, log, {index for index, _event in removed})
+    # The footage-moment picker already exists in this run, so its key cannot be written now. Queue the repair
+    # for the rerun, which applies it before the pickers are created.
+    st.session_state[f"event_reindex::{match_id}"] = {
+        "removed": sorted(index for index, _event in removed),
+        "remaining": len(log.events),
+    }
     if len(removed) == 1:
         event = removed[0][1]
         message = f"Removed {event.type} at {_clock(event.time_s)} from the timeline."
@@ -2055,6 +2079,7 @@ def replay_section(
     if not replay_path.exists():
         st.info("The animated replay is built together with the report above - press **Build report**.")
         return
+    _apply_event_picker_repair(match_id)
     replay = _load_replay_cached(str(replay_path), replay_path.stat().st_mtime_ns)
     record = library.load(match_id)
     team_names = record.team_names
