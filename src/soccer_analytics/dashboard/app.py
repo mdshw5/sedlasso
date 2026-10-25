@@ -2058,6 +2058,7 @@ def identity_section(
             )
         else:
             st.caption("Press **Cut the clip** to produce a clip cropped around this player.")
+        job_ui.match_jobs_panel(match_id, compact=True, key_prefix="clip_jobs")
 
 
 def replay_section(
@@ -2718,6 +2719,7 @@ def events_section(
                     },
                 )
                 st.success(f"{tier} reel queued - progress appears under Background jobs.")
+        job_ui.match_jobs_panel(match_id, compact=True, key_prefix="reel_jobs")
 
 
 def show_flash(key: str) -> None:
@@ -4540,7 +4542,13 @@ def _video_export_progress(library: MatchLibrary, match_id: str) -> None:
     previous = st.session_state.get(watch_key)
     st.session_state[watch_key] = state
     if state == "queued":
-        st.info("Queued - the job manager will start the export when a slot is free.")
+        if jobs.JOBS.has_active(match_id, kinds=("video_export",)):
+            st.info("Queued - the job manager will start the export when a slot is free.")
+        else:
+            st.warning(
+                "This export was queued but no export job is active any more. Press **Export the match video** "
+                "to start it again; the job log under Background jobs has the reason if it failed."
+            )
     elif state == "running":
         progress = float(status.get("progress") or 0.0)
         st.progress(min(1.0, max(0.0, progress)), text=str(status.get("message") or "Exporting..."))
@@ -4730,6 +4738,7 @@ def video_export_section(
         help="Runs in the background; progress appears here and the page stays usable.",
     )
     _video_export_progress(library, match_id)
+    job_ui.match_jobs_panel(match_id, compact=True, key_prefix="export_jobs")
 
 
 video_export_section(library, match_id, segment, segment_dir, analysis_source, probe)

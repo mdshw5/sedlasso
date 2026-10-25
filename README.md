@@ -139,9 +139,7 @@ The dashboard walks through four steps in order, and each one stores its result 
 
 ### Background jobs
 
-Heavy work never runs in the Streamlit script thread. The page writes a job spec under `data/jobs/`, a small manager (`scripts/job_manager.py`) starts workers (`scripts/run_job.py`) outside the dashboard, and the page polls the job's `status.json` in a fragment. A global bar at the top of the page shows work running on *any* match, so you can start the enrichment for one game and open another without the dashboard freezing.
-
-The manager runs at most `SOCCER_MAX_JOBS` jobs at once (default 2), treats `gpu` work as exclusive so two scans never share the GPU, and starts every worker at a lower CPU priority than the dashboard. Jobs carry their own log (`data/jobs/<id>/job.log`) and survive a Streamlit reload; queued work can be cancelled from the page. The queue directory is git-ignored.
+Heavy work never runs in the Streamlit script thread. The page writes a job spec under `data/jobs/`, a small manager (`scripts/job_manager.py`) starts workers (`scripts/run_job.py`) outside the dashboard, and the page polls the job's `status.json` in a fragment. A persistent **Background jobs** expander sits at the top of every page, and the export, reel and clip controls carry a compact jobs panel beside them, so a queued job is never hidden by a scroll position. The manager runs at most `SOCCER_MAX_JOBS` jobs at once (default 2), treats `gpu` work as exclusive so two scans never share the GPU, and starts every worker at a lower CPU priority than the dashboard. Jobs carry their own log (`data/jobs/<id>/job.log`) and survive a Streamlit reload; queued work can be cancelled from the match panel. The queue directory is git-ignored.
 
 ### The annotated stream server
 

@@ -235,6 +235,21 @@ class JobStore:
         )
 
     # --- control --------------------------------------------------------------------------------------------
+    def retry(self, job_id: str) -> dict:
+        """Queue a fresh copy of a finished job's spec; the old status stays as the record of what failed."""
+        spec = read_json(self.spec_path(job_id))
+        if not spec:
+            return {}
+        return self.submit(
+            kind=str(spec.get("kind") or "command"),
+            label=str(spec.get("label") or "Retry"),
+            match_id=str(spec.get("match_id") or ""),
+            argv=spec.get("argv") or (),
+            watch=spec.get("watch"),
+            params=spec.get("params") or {},
+            resources=spec.get("resources") or (),
+        )
+
     def cancel(self, job_id: str) -> dict:
         """Cancel a queued job immediately, or ask a running runner to stop its child."""
         status = self.status(job_id)

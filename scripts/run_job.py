@@ -26,6 +26,17 @@ from soccer_analytics.analysis.library import MatchLibrary  # noqa: E402
 from soccer_analytics.dashboard import jobs  # noqa: E402
 
 POLL_S = 1.0
+# Kinds that are just a command plus a status file the child writes. The dashboard uses descriptive kind names for
+# the job panel; they all take the same runner path.
+COMMAND_KINDS = {
+    "command",
+    "stage_a",
+    "ball_scan",
+    "audio_scan",
+    "jersey_scan",
+    "detections",
+    "video_export",
+}
 
 
 class Status:
@@ -122,7 +133,7 @@ class Runner:
         with redirect_stdout(self.log), redirect_stderr(self.log):
             try:
                 kind = str(self.spec.get("kind") or "command")
-                if kind == "command":
+                if kind in COMMAND_KINDS:
                     code = self._run_command()
                 elif kind == "report":
                     code = self._run_report()
@@ -137,6 +148,11 @@ class Runner:
             except Exception as exc:  # noqa: BLE001 - the status file is the user-facing report
                 message = f"{type(exc).__name__}: {exc}"
                 print(traceback.format_exc(), file=sys.stderr)
+                self._write_watch(
+                    state="error",
+                    message=message,
+                    progress=float(self.status.payload.get("progress") or 0.0),
+                )
                 self.status.update(
                     state="error", stage="error", message=message, error=traceback.format_exc(limit=5),
                     finished=time.time(), force=True,
@@ -173,6 +189,7 @@ class Runner:
         while self.child.poll() is None:
             if self.cancelled:
                 self._stop_child()
+                self._write_watch(state="cancelled", message="Cancelled.")
                 self.status.update(
                     state="cancelled", stage="cancelled", message="Cancelled.",
                     finished=time.time(), force=True,
@@ -196,6 +213,7 @@ class Runner:
         code = int(self.child.returncode or 0)
         inner = jobs.read_json(Path(str(watch))) if watch else {}
         if self.cancelled:
+            self._write_watch(state="cancelled", message="Cancelled.")
             self.status.update(
                 state="cancelled", stage="cancelled", message="Cancelled.",
                 finished=time.time(), force=True,
@@ -203,6 +221,11 @@ class Runner:
             return 1
         if code != 0 or inner.get("state") == "error":
             message = str(inner.get("error") or inner.get("message") or f"Command exited with code {code}.")
+            if inner.get("state") != "error":
+                self._write_watch(
+                    state="error", message=message,
+                    progress=float(self.status.payload.get("progress") or base),
+                )
             self.status.update(
                 state="error", stage="error", message=message, error=message,
                 progress=float(self.status.payload.get("progress") or base),
@@ -210,6 +233,8 @@ class Runner:
             )
             return 1
         message = str(inner.get("message") or "Finished.")
+        if watch and inner.get("state") not in ("done", "partial"):
+            self._write_watch(state="done", message=message, progress=1.0)
         self.status.update(
             state="done", stage="done", progress=1.0, message=message,
             result={"watch": watch, "state": inner.get("state")} if watch else {},

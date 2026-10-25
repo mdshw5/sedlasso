@@ -55,6 +55,30 @@ def test_cancel_queued_job_is_terminal(tmp_path: Path) -> None:
     assert store.status(status["job_id"])["state"] == "cancelled"
 
 
+def test_retry_clones_a_failed_job_spec(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    status = store.submit(
+        kind="video_export",
+        label="Video export",
+        match_id="a",
+        argv=["ffmpeg", "-i", "in.mp4"],
+        watch=tmp_path / "watch.json",
+        params={"output": "/tmp/out.mp4"},
+        resources=("gpu",),
+    )
+    payload = store.status(status["job_id"])
+    payload.update(state="error", message="boom")
+    store.status_path(status["job_id"]).write_text(json.dumps(payload))
+
+    retried = store.retry(status["job_id"])
+    assert retried["job_id"] != status["job_id"]
+    spec = json.loads(store.spec_path(retried["job_id"]).read_text())
+    assert spec["kind"] == "video_export"
+    assert spec["argv"] == ["ffmpeg", "-i", "in.mp4"]
+    assert spec["params"] == {"output": "/tmp/out.mp4"}
+    assert spec["resources"] == ["gpu"]
+
+
 def test_clear_finished_leaves_active_jobs_alone(tmp_path: Path) -> None:
     store = _store(tmp_path)
     done = store.submit(kind="report", label="Report", match_id="a")
@@ -110,7 +134,7 @@ def test_manager_runs_a_real_command_job(tmp_path: Path) -> None:
         "time.sleep(0.2)\n"
     )
     status = store.submit(
-        kind="command",
+        kind="video_export",
         label="Smoke",
         match_id="demo",
         argv=[sys.executable, "-c", script],
