@@ -1489,10 +1489,16 @@ def fit_from_clicks(
     # rejection instead.
     diagnosis = diagnose_fit(calibration)
     if diagnosis.reason or diagnosis.too_few_agreeing:
+        if diagnosis.too_few_agreeing and len(landmarks) <= 4:
+            cause = (
+                "exactly four clicks were supplied, and one of them disagrees with the rest - there is no spare "
+                "click to drop, so the fit cannot be verified. Add a fifth spread landmark, or remove the click "
+                "the residual table flags, and refit"
+            )
+        else:
+            cause = diagnosis.reason or "fewer than four clicks agree with each other"
         st.session_state["calib_fit_error"] = (
-            "the refit is not usable - "
-            + (diagnosis.reason or "the clicks do not agree with each other")
-            + ". The saved calibration was left unchanged."
+            "the refit is not usable - " + cause + ". The saved calibration was left unchanged."
         )
         return None
     st.session_state.pop("calib_fit_error", None)
@@ -3681,6 +3687,15 @@ if segment is not None:
         record.goal_width_m = float(goal_width_m)
         library.save(record)
         st.session_state.pop("calibration", None)
+        # The click pixels were placed against the old world coordinates: a corner at (0, 64) is no longer the
+        # same physical point at (0, 45), and the goal posts move when the goal width changes. Keeping those
+        # clicks in the gesture state and re-solving them against the new table is what produces a misleading
+        # "clicks do not agree" error with exactly four landmarks. Drop the set; the restore block below will
+        # only bring it back when the saved clicks were explicitly labelled against these dimensions.
+        st.session_state["calib_points"] = []
+        st.session_state["calib_landmarks"] = []
+        st.session_state["calib_seeded"] = []
+        st.session_state.pop("calib_fit_signature", None)
         if had_calibration:
             st.warning(
                 "The pitch or goal size changed after this match was calibrated, so the saved calibration no "
