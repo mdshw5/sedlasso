@@ -34,6 +34,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from soccer_analytics.analysis import stage_b
+from soccer_analytics.analysis.ball_lock import ball_image_from_scan
 from soccer_analytics.analysis.library import MatchLibrary
 from soccer_analytics.analysis.projection import project_ball_track, project_segment, segment_poses
 from soccer_analytics.analysis.stage_a import load_segment
@@ -42,14 +43,14 @@ from soccer_analytics.dashboard.replay import build_replay, roles_and_attack, tr
 BALL_TRACK_FILE = "ball_track.json"
 
 
-def _ball_for_replay(segment_dir: Path, calibration, q, focal):
-    """The segment's ball scan projected into pitch meters, or None when it has not been scanned."""
+def _ball_records(segment_dir: Path) -> list[dict] | None:
+    """The segment's raw ball scan records, or None when it has not been scanned."""
     try:
         payload = json.loads((segment_dir / BALL_TRACK_FILE).read_text())
     except (OSError, json.JSONDecodeError):
         return None
     records = payload.get("frames") or []
-    return project_ball_track(records, calibration, q, focal) if records else None
+    return records or None
 
 
 def main() -> int:
@@ -83,11 +84,14 @@ def main() -> int:
     detections = project_segment(segment, calibration, poses=(q, focal))
     print(f"projected {len(detections.frame)} detections ({time.time() - started:.0f}s)", flush=True)
 
+    ball_records = _ball_records(segment_dir)
+    ball_image = ball_image_from_scan(ball_records, len(segment.time)) if ball_records else None
     report, assignment = stage_b.build_report(
         detections,
         pitch_length_m=record.pitch_length_m,
         pitch_width_m=record.pitch_width_m,
         match_frames=len(segment.time),
+        ball_image=ball_image,
     )
     print(f"tracked {len(report.players)} players ({time.time() - started:.0f}s)", flush=True)
 
@@ -102,7 +106,8 @@ def main() -> int:
         detections.aim_xy,
         report.players,
         record.team_names,
-        ball=_ball_for_replay(segment_dir, calibration, q, focal),
+        ball=project_ball_track(ball_records, calibration, q, focal) if ball_records else None,
+        ball_image=ball_image,
         team_colors=[metrics.kit_rgb for metrics in report.teams],
         camera_xy=detections.camera_xy,
         roles=roles,
@@ -128,6 +133,7 @@ def main() -> int:
                 for player in report.players
             ],
             "momentum": report.momentum,
+            "possession": report.possession,
             "notes": report.notes,
             "pitch": [record.pitch_length_m, record.pitch_width_m],
             "detections_used": report.detections_used,

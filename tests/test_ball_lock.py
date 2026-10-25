@@ -5,9 +5,12 @@ from __future__ import annotations
 import numpy as np
 
 from soccer_analytics.analysis.ball_lock import (
+    BallImage,
     BallLock,
     _long_runs,
+    ball_image_from_scan,
     ball_lock_from_aligned,
+    foot_distance,
     image_space_possession,
 )
 
@@ -88,3 +91,33 @@ def test_image_space_possession_skips_unlocked_frames() -> None:
     )
     result = image_space_possession(lock, det_frame, det_box, det_team)
     assert result["contested_frames"] == 0
+
+
+def test_ball_image_from_scan_keeps_only_measured_or_forecast_frames() -> None:
+    records = [
+        {"i": 1, "status": "tracking", "u": 0.25, "v": 0.30},
+        {"i": 2, "status": "coasting", "u": 0.30, "v": 0.31},
+        {"i": 3, "status": "out_of_view", "u": 0.90, "v": 0.90},
+        {"i": 4, "status": "lost"},
+        {"i": 99, "status": "tracking", "u": 0.10, "v": 0.10},
+        {"i": 0, "status": "tracking", "u": None, "v": 0.20},
+    ]
+    image = ball_image_from_scan(records, 5)
+    assert image.valid.tolist() == [False, True, True, False, False]
+    assert image.u[1] == 0.25 and image.v[2] == 0.31
+    assert image.source == "ball scan"
+
+
+def test_image_space_possession_accepts_a_scan_image() -> None:
+    det_frame = np.array([0, 0])
+    det_box = np.array([[0.48, 0.2, 0.52, 0.4], [0.88, 0.2, 0.92, 0.4]])
+    det_team = np.array([0, 1])
+    image = BallImage(u=np.array([0.5]), v=np.array([0.4]), valid=np.array([True]), source="ball scan")
+    result = image_space_possession(image, det_frame, det_box, det_team)
+    assert result["touches"] == {0: 1, 1: 0}
+
+
+def test_foot_distance_falls_back_to_horizontal_when_v_is_unknown() -> None:
+    box = np.array([[0.48, 0.2, 0.52, 0.4]])
+    assert np.isclose(foot_distance(box, 0.6, np.nan)[0], 0.1)
+    assert np.isclose(foot_distance(box, 0.5, 0.4)[0], 0.0)

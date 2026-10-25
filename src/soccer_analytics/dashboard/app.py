@@ -46,6 +46,7 @@ if str(SRC_ROOT) not in sys.path:
 from soccer_analytics.analysis import game as game_lib
 from soccer_analytics.analysis import identity as identity_lib
 from soccer_analytics.analysis import stage_a, stage_b
+from soccer_analytics.analysis.ball_lock import ball_image_from_scan
 from soccer_analytics.analysis import detect_run
 from soccer_analytics.analysis.events import (
     MIN_PROMINENCE,
@@ -704,20 +705,26 @@ def _ball_scan_alive(segment_dir: Path) -> bool:
     return _scan_alive(_ball_status(segment_dir))
 
 
-def _ball_track_for_replay(
-    segment_dir: Path, calibration: PitchCalibration, q: np.ndarray, focal: np.ndarray
-):  # noqa: ANN201 - (xy (F,2), measured (F,)) from project_ball_track, or None
-    """The segment's ball scan projected into pitch meters, or None when it has not been scanned.
+def _ball_scan_records(segment_dir: Path) -> list[dict] | None:
+    """The segment's raw ball scan records, or None when it has not been scanned.
 
-    A partial scan is used as it stands: the replay draws the frames the scan has reached, and the scan's own
-    status line says whether it is finished. A scan that lands after the report was built shows up on the next
-    build - which is cheap, so the page tells the user to press it again rather than rebuilding behind their back.
+    A partial scan is used as it stands: the report measures possession on the frames the scan has reached and the
+    replay draws them, and the scan's own status line says whether it is finished. A scan that lands after the
+    report was built shows up on the next build - which is cheap, so the page tells the user to press it again
+    rather than rebuilding behind their back.
     """
     try:
         payload = json.loads((Path(segment_dir) / BALL_TRACK_FILE).read_text())
     except (OSError, json.JSONDecodeError):
         return None
     records = payload.get("frames") or []
+    return records or None
+
+
+def _ball_track_for_replay(
+    records: list[dict] | None, calibration: PitchCalibration, q: np.ndarray, focal: np.ndarray
+):  # noqa: ANN201 - (xy (F,2), measured (F,)) from project_ball_track, or None
+    """The segment's ball scan projected into pitch meters, or None when there are no records."""
     if not records:
         return None
     return project_ball_track(records, calibration, q, focal)
@@ -749,17 +756,20 @@ def _build_report_and_replay(
             calibration,
             on_progress=lambda fraction: advance(0.40 * fraction, "Projecting detections to the pitch..."),
         )
+        ball_records = _ball_scan_records(segment_dir)
+        ball_image = ball_image_from_scan(ball_records, len(segment.time)) if ball_records else None
         report, assignment = stage_b.build_report(
             detections,
             pitch_length_m=length_m,
             pitch_width_m=width_m,
             match_frames=len(segment.time),
+            ball_image=ball_image,
             on_progress=lambda fraction: advance(
                 0.40 + 0.45 * fraction, "Tracking players, teams and momentum..."
             ),
         )
         advance(0.88, "Building the replay...")
-        ball = _ball_track_for_replay(segment_dir, calibration, q, focal)
+        ball = _ball_track_for_replay(ball_records, calibration, q, focal)
         roles, attack = roles_and_attack(
             report, detections, assignment, segment=segment, pitch_length_m=length_m,
             swap_attack=bool(record.swap_attack),
@@ -772,6 +782,7 @@ def _build_report_and_replay(
             report.players,
             record.team_names,
             ball=ball,
+            ball_image=ball_image,
             team_colors=[metrics.kit_rgb for metrics in report.teams],
             camera_xy=detections.camera_xy,
             roles=roles,
@@ -792,6 +803,7 @@ def _build_report_and_replay(
                 for player in report.players
             ],
             "momentum": report.momentum,
+            "possession": report.possession,
             "notes": report.notes,
             "pitch": [length_m, width_m],
             "detections_used": report.detections_used,
@@ -2400,9 +2412,9 @@ def replay_section(
         st.caption(
             "The team rosters above connect each number with a name; use this table to correct a single track "
             "when the *number* itself is wrong. A manual entry here wins over both the scan and the team roster, "
-            "so use it sparingly - and note it belongs to this match's track ids only. Distances, speeds and the "
-            "touch proxy are in the table above; a touch means the player was the nearest to the ball proxy while "
-            "within 12 m of it."
+            "so use it sparingly - and note it belongs to this match's track ids only. Distances, speeds and "
+            "touches are in the table above; a touch means the player was the nearest to the ball - the scanned "
+            "ball in the picture when available, else the camera aim point - and inside the possession gate."
         )
         editors = []
         for player in replay["players"]:
@@ -4518,15 +4530,20 @@ else:
         metric_columns[3].metric("Tracks with a team", sum(1 for p in payload["players"] if p["team"] >= 0))
         team_names = _team_name_editor(library, match_id, payload)
         # The table says the name rather than the index, and leaves out the kit color: it is shown as a swatch just
-        # above, where it can actually be seen.
-        team_rows = [
-            {
-                **{key: value for key, value in row.items() if key != "kit_rgb"},
-                "team": team_name(int(row["team"]), team_names),
-            }
-            for row in payload["teams"]
-        ]
+        # above, where it can actually be seen. Possession is shown as the percentage a viewer expects rather than
+        # the raw fraction stored in the report.
+        team_rows = []
+        for row in payload["teams"]:
+            listed = {"team": team_name(int(row["team"]), team_names)}
+            listed.update({key: value for key, value in row.items() if key not in ("kit_rgb", "possession_share")})
+            listed["possession %"] = round(100.0 * float(row.get("possession_share") or 0.0), 1)
+            team_rows.append(listed)
         st.dataframe(pd.DataFrame(team_rows), hide_index=True, width="stretch")
+        st.caption(
+            "Possession is the share of contested frames - frames with a labeled player near the ball - "
+            "combined by time, so a quiet minute cannot outweigh a busy one. With a ball scan, 'near' is "
+            "measured in the picture; otherwise the camera aim point is the fallback."
+        )
         # The momentum curve is not drawn here any more: it is the timeline strip above the pitch, where it sits
         # on the same clock as the events and the replay. A second copy as a chart was a second thing to read.
         st.subheader("Player replay - pitch usage over time")

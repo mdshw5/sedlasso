@@ -18,6 +18,11 @@ Two things it gives that the pitch-space pipeline cannot:
 The image coordinates are normalized by the log's own frame width (2560 px on this camera, where ``Crowdx1280`` is
 the center), so they are resolution-independent and line up with the detection boxes, which the pipeline also
 normalizes by frame width.
+
+The ball scan (``analysis.ball``) records the same quantity per frame - a normalized ``u``/``v`` with a status - so
+:class:`BallImage` is the shared shape for both measurements. Stage B and the replay prefer the scan's position
+where it has one and fall back to the hardware lock or the camera aim point; the geometry, and therefore the
+image-space measure, is identical.
 """
 
 from __future__ import annotations
@@ -70,6 +75,78 @@ class BallLock:
             "size": [None if not np.isfinite(x) else float(x) for x in self.size],
             "speed": [round(float(x), 5) for x in self.speed],
         }
+
+
+@dataclass
+class BallImage:
+    """A per-frame ball position in the picture, normalized by frame width.
+
+    This is the common shape of the two image-space ball measurements: the ball scan's ``tracking``/``coasting``
+    frames and the gimbal's hardware lock. ``u``/``v`` are NaN where there is no position; ``valid`` says whether
+    the row carries a usable measurement, so a caller can report coverage instead of silently reading a gap as a
+    ball at pixel zero. ``source`` names the measurement in report notes and the replay payload.
+    """
+
+    u: np.ndarray  # (F,) ball image x / width, NaN where unknown
+    v: np.ndarray  # (F,) ball image y / width, NaN where unknown
+    valid: np.ndarray  # (F,) bool: this row has a position
+    source: str = "ball scan"
+
+    @property
+    def frames(self) -> int:
+        return len(self.valid)
+
+
+def ball_image_from_lock(lock: BallLock) -> BallImage:
+    """The hardware lock as a :class:`BallImage`; ``valid`` requires a position, not just the lock flag."""
+    return BallImage(
+        u=np.asarray(lock.u, dtype=np.float64),
+        v=np.asarray(lock.v, dtype=np.float64),
+        valid=np.asarray(lock.locked, dtype=bool) & np.isfinite(lock.u),
+        source="gimbal lock",
+    )
+
+
+def ball_image_from_scan(records, frame_count: int, *, source: str = "ball scan") -> BallImage:
+    """Per-frame ball positions from a segment's ``ball_track.json`` records.
+
+    ``tracking`` is a detection and ``coasting`` is the tracker's forecast across a short miss; both carry a
+    position that is meaningful for possession and both are what the replay already draws. ``out_of_view`` and
+    ``lost`` are deliberately excluded - they do not say where the ball is, and treating a forecast that left the
+    picture as a position is exactly the mistake the ball tracker was built to avoid. A later record for the same
+    frame wins.
+    """
+    frames = max(0, int(frame_count))
+    u = np.full(frames, np.nan, dtype=np.float64)
+    v = np.full(frames, np.nan, dtype=np.float64)
+    valid = np.zeros(frames, dtype=bool)
+    for record in records or []:
+        if record.get("status") not in ("tracking", "coasting"):
+            continue
+        frame = int(record.get("i", -1))
+        uu, vv = record.get("u"), record.get("v")
+        if not (0 <= frame < frames) or uu is None or vv is None:
+            continue
+        u[frame] = float(uu)
+        v[frame] = float(vv)
+        valid[frame] = True
+    return BallImage(u=u, v=v, valid=valid, source=source)
+
+
+def foot_distance(box: np.ndarray, u: float, v: float) -> np.ndarray:
+    """Distance in the picture from each box's foot point to a ball position.
+
+    ``box`` is one ``(4,)`` box or an ``(N, 4)`` array, ``(x1, y1, x2, y2)`` normalized by frame width. The ball's
+    ``v`` may be NaN when the measurement only knows its horizontal position (the gimbal lock without a box
+    offset); then horizontal distance is the best available measure, and the caller is still measuring the picture
+    rather than the ground.
+    """
+    box = np.asarray(box, dtype=np.float64)
+    foot_u = (box[..., 0] + box[..., 2]) / 2.0
+    foot_v = box[..., 3]
+    if not np.isfinite(v):
+        return np.abs(foot_u - u)
+    return np.hypot(foot_u - u, foot_v - v)
 
 
 def _long_runs(flags: np.ndarray, minimum: int) -> np.ndarray:
@@ -152,7 +229,7 @@ def ball_lock_from_logs(logs, *, start_s: float, fps: float, frame_count: int) -
 
 
 def image_space_possession(
-    lock: BallLock,
+    ball: BallLock | BallImage,
     det_frame: np.ndarray,
     det_box: np.ndarray,
     det_team: np.ndarray,
@@ -161,35 +238,30 @@ def image_space_possession(
 ) -> dict:
     """Possession from the ball's image position and the players' image positions - no pitch, no homography.
 
-    For each frame the ball is locked, the nearest player *in the picture* is found (by the distance from the ball's
-    image position to the player's foot point) and, if within ``radius``, that player's team is credited with the
-    touch. Returns per-team touch counts, the share, and how many locked frames were contested.
+    For each frame with a ball position, the nearest player *in the picture* is found (by the distance from the
+    ball's image position to the player's foot point) and, if within ``radius``, that player's team is credited
+    with the touch. Returns per-team touch counts, the share, and how many measured frames were contested.
 
-    ``det_frame``/``det_box`` are the segment's detection arrays (box normalized by frame width, ``x1,y1,x2,y2``);
-    ``det_team`` is the team label per detection (``-1`` for referee/unknown), which the caller gets from Stage B's
-    track assignment. This is deliberately a *picture* measure: it answers "who is on the ball" without ever
-    projecting to the ground, so it survives a bad calibration.
+    ``ball`` is either the gimbal's :class:`BallLock` or a :class:`BallImage` built from the ball scan. Both are
+    picture measurements, so this survives a bad calibration; a lock with no ``v`` still works from horizontal
+    distance. ``det_frame``/``det_box`` are the segment's detection arrays (box normalized by frame width,
+    ``x1,y1,x2,y2``); ``det_team`` is the team label per detection (``-1`` for referee/unknown), which the caller
+    gets from Stage B's track assignment. This answers "who is on the ball" without ever projecting to the ground.
     """
-    foot_u = (det_box[:, 0] + det_box[:, 2]) / 2.0
-    foot_v = det_box[:, 3]
+    image = ball_image_from_lock(ball) if isinstance(ball, BallLock) else ball
     by_frame: dict[int, list[int]] = {}
     for row, frame in enumerate(det_frame):
         by_frame.setdefault(int(frame), []).append(row)
 
     touches = {0: 0, 1: 0}
     contested = 0
-    for frame in range(lock.frames):
-        if not lock.locked[frame] or not np.isfinite(lock.u[frame]):
+    for frame in range(image.frames):
+        if not image.valid[frame] or not np.isfinite(image.u[frame]):
             continue
         rows = by_frame.get(frame)
         if not rows:
             continue
-        bu, bv = lock.u[frame], lock.v[frame]
-        if not np.isfinite(bv):
-            # Without the ball's image y, fall back to the horizontal distance only - still a picture measure.
-            distance = np.abs(foot_u[rows] - bu)
-        else:
-            distance = np.hypot(foot_u[rows] - bu, foot_v[rows] - bv)
+        distance = foot_distance(det_box[rows], float(image.u[frame]), float(image.v[frame]))
         nearest = int(np.argmin(distance))
         if distance[nearest] > radius:
             continue

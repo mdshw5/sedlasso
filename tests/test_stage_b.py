@@ -5,8 +5,15 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from soccer_analytics.analysis.projection import project_segment, segment_poses
-from soccer_analytics.analysis.stage_b import build_report, _team_assignment, _track_people
+from soccer_analytics.analysis.ball_lock import BallImage
+from soccer_analytics.analysis.projection import PitchDetections, project_segment, segment_poses
+from soccer_analytics.analysis.stage_b import (
+    _momentum,
+    _possession_from_momentum,
+    _team_assignment,
+    _track_people,
+    build_report,
+)
 from soccer_analytics.geometry.pitch_calibration import PitchCalibration
 
 from synthetic_match import PITCH_LENGTH, PITCH_WIDTH, simulate_match
@@ -185,10 +192,81 @@ def test_territory_and_momentum_follow_the_simulated_play() -> None:
     assert report.momentum, "no momentum buckets were produced"
     for bucket in report.momentum.values():
         assert bucket["team_0"] + bucket["team_1"] == pytest.approx(1.0, abs=1e-3)
-    mean_share = float(np.mean([m["team_0"] for m in report.momentum.values()]))
+    mean_share = _possession_from_momentum(report.momentum)
     assert mean_share > 0.5, f"team 0 was attacking but only held {mean_share:.0%} of the action"
     assert team0.possession_share == pytest.approx(mean_share, abs=0.01)
     assert team0.possession_share + team1.possession_share == pytest.approx(1.0, abs=0.02)
+
+
+def test_match_possession_weights_minutes_by_contested_frames() -> None:
+    """A minute with one contested frame must not count as much as a minute with hundreds."""
+    momentum = {
+        0: {"team_0": 1.0, "team_1": 0.0, "contested_frames": 1},
+        1: {"team_0": 0.0, "team_1": 1.0, "contested_frames": 99},
+    }
+    assert _possession_from_momentum(momentum) == pytest.approx(0.01)
+    assert _possession_from_momentum({}) == 0.0
+
+
+def _two_team_detections() -> PitchDetections:
+    """Two players and two frames; the camera aim is on team 1 both times."""
+    box = np.array(
+        [
+            [0.48, 0.2, 0.52, 0.4],
+            [0.88, 0.2, 0.92, 0.4],
+            [0.48, 0.2, 0.52, 0.4],
+            [0.88, 0.2, 0.92, 0.4],
+        ]
+    )
+    return PitchDetections(
+        frame=np.array([0, 0, 1, 1], dtype=np.int64),
+        time=np.array([0.0, 0.0, 1.0, 1.0]),
+        xy=np.array([[10.0, 10.0], [90.0, 10.0], [10.0, 10.0], [90.0, 10.0]]),
+        sigma_m=np.ones(4),
+        valid=np.ones(4, dtype=bool),
+        height_px=np.full(4, 100.0),
+        box=box,
+        conf=np.ones(4),
+        kit=np.zeros((4, 12)),
+        det_track=np.array([1, 2, 1, 2]),
+        det_index=np.arange(4),
+        aim_xy=np.array([[90.0, 10.0], [90.0, 10.0]]),
+        camera_xy=np.array([0.0, 0.0]),
+    )
+
+
+def test_image_space_ball_overrides_the_camera_aim_proxy() -> None:
+    """Frame 0's measured ball sits on team 0, while the camera aim is on team 1; frame 1 has no ball image."""
+    detections = _two_team_detections()
+    ball_image = BallImage(
+        u=np.array([0.52, np.nan]),
+        v=np.array([0.40, np.nan]),
+        valid=np.array([True, False]),
+    )
+    momentum, coverage = _momentum(
+        detections,
+        np.ones(4, dtype=bool),
+        {1: 0, 2: 1},
+        np.array([1, 2, 1, 2]),
+        ball_image=ball_image,
+    )
+    assert momentum[0]["team_0"] == pytest.approx(0.5)
+    assert coverage == {
+        "image_available_frames": 1,
+        "image_contested_frames": 1,
+        "aim_contested_frames": 1,
+    }
+
+
+def test_without_a_ball_image_possession_stays_on_the_aim_proxy() -> None:
+    momentum, coverage = _momentum(
+        _two_team_detections(),
+        np.ones(4, dtype=bool),
+        {1: 0, 2: 1},
+        np.array([1, 2, 1, 2]),
+    )
+    assert momentum[0]["team_1"] == pytest.approx(1.0)
+    assert coverage["image_contested_frames"] == 0 and coverage["aim_contested_frames"] == 2
 
 
 def test_report_states_its_own_limitations(prepared) -> None:

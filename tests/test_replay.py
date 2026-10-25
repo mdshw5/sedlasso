@@ -10,9 +10,11 @@ import numpy as np
 import pytest
 
 from soccer_analytics.analysis import stage_b
+from soccer_analytics.analysis.ball_lock import BallImage
 from soccer_analytics.analysis.projection import project_ball_track, project_segment, segment_poses
 from soccer_analytics.analysis.events import Event
 from soccer_analytics.dashboard.replay import (
+    _touch_counts,
     aiming_goal,
     build_replay,
     deleted_events,
@@ -385,6 +387,32 @@ def test_the_touch_proxy_is_bounded_by_frames_with_an_aim(replay_case) -> None:
     aimed = sum(1 for entry in replay["aim"] if entry is not None)
     assert 0 < touches <= aimed, "at most one player touches the ball proxy per frame"
     assert all(player["stats"]["touches"] >= 0 for player in replay["players"])
+    assert replay["possession"]["space"] == "pitch"
+
+
+def test_replay_touches_prefer_the_scanned_ball_to_the_aim() -> None:
+    """Frame 0's ball is on team 0's feet; frame 1 has no scan, so the aim (on team 1) supplies the touch."""
+    frames = np.array([0, 1])
+    players = [
+        stage_b.PlayerTrack(
+            track_id=1, team=0, frame=frames, time=np.array([0.0, 1.0]),
+            xy=np.array([[10.0, 10.0], [10.0, 10.0]]), sigma_m=np.ones(2),
+            speed_kmh=np.zeros(2), distance_m=0.0,
+            box=np.array([[0.48, 0.2, 0.52, 0.4], [0.48, 0.2, 0.52, 0.4]]),
+        ),
+        stage_b.PlayerTrack(
+            track_id=2, team=1, frame=frames, time=np.array([0.0, 1.0]),
+            xy=np.array([[90.0, 10.0], [90.0, 10.0]]), sigma_m=np.ones(2),
+            speed_kmh=np.zeros(2), distance_m=0.0,
+            box=np.array([[0.88, 0.2, 0.92, 0.4], [0.88, 0.2, 0.92, 0.4]]),
+        ),
+    ]
+    ball_image = BallImage(
+        u=np.array([0.52, np.nan]), v=np.array([0.40, np.nan]), valid=np.array([True, False])
+    )
+    touches, meta = _touch_counts(players, [[90.0, 10.0], [90.0, 10.0]], ball_image)
+    assert touches == {1: 1, 2: 1}
+    assert meta == {"space": "mixed", "image_touches": 1, "pitch_touches": 1}
 
 
 def test_the_player_table_merges_shirt_numbers(replay_case) -> None:

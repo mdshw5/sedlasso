@@ -23,6 +23,7 @@ from scipy.optimize import linear_sum_assignment
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import min_weight_full_bipartite_matching
 
+from soccer_analytics.analysis.ball_lock import BallImage, POSSESSION_IMAGE_RADIUS, foot_distance
 from soccer_analytics.analysis.kit import DESCRIPTOR_SIZE, kit_rgb
 from soccer_analytics.analysis.projection import PitchDetections, on_pitch_mask
 
@@ -99,7 +100,11 @@ class TeamMetrics:
     top_speed_kmh: float
     mean_speed_kmh: float
     mean_x_fraction: float  # mean pitch x of the team's players, 0 = own goal line, 1 = opponent's
-    possession_share: float  # share of frames the team had the nearest player to the action
+    # Share of *contested frames* the team had the nearest player to the ball, combined across the match by frames
+    # rather than by minutes. A contested frame is one where a labelled player was within the possession gate - in
+    # the picture when a ball scan (or lock) supplied a position, else in pitch space around the camera aim.
+    # Stoppages and frames with no labelled player nearby are excluded.
+    possession_share: float
     # The team's mean kit color as RGB, or None when the kits could not be separated. It is what makes "team 0"
     # recognizable - it anchors the name the user gives the team to the color they can see on the pitch.
     kit_rgb: tuple[int, int, int] | None = None
@@ -117,6 +122,9 @@ class MatchReport:
     pitch_width_m: float
     frames_analyzed: int
     detections_used: int
+    # Which measurement decided possession and how much of the match it covered: ``space`` is "image", "mixed"
+    # or "pitch"; the frame counts make the claim auditable instead of a boolean. Absent from older reports.
+    possession: dict = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
 
@@ -712,13 +720,16 @@ def _momentum(
     track_id: np.ndarray,
     bucket_s: float = 60.0,
     possession_radius_m: float = 12.0,
+    ball_image: BallImage | None = None,
     on_progress=None,
-) -> dict:
-    """Per-minute action share per team, and the mean x of the action (territory).
+) -> tuple[dict, dict]:
+    """Per-minute action share per team, the mean x of the action (territory), and possession coverage.
 
-    Possession is decided by *proximity to the ball proxy*, not by counting players: the gimbal aims at the ball, so
-    the pitch point it is aimed at each frame is the best available ball position. Whoever has the nearest player to
-    that point is treated as being on the ball, and the team share is the fraction of frames won.
+    Possession is decided by the nearest *labelled player*, not by counting players. When a ball scan (or the
+    gimbal lock) supplies an image position for the frame, the nearest foot in the picture is used; otherwise the
+    camera's aim point is the pitch-space proxy. The image measure deliberately avoids the homography: a ball in
+    the air has no ground point, and a poor calibration distorts pitch distances, while "which player is nearest
+    the ball in the picture" is a direct measurement in both cases.
 
     Only players with a team label take part: a track the clustering could not place - the referee above all - is
     not allowed to win frames, but unlike before, *every* labeled player can, not only the few tracks that were
@@ -730,11 +741,15 @@ def _momentum(
     Counting detections instead would let the referee decide the result: a referee follows the ball all match long, so
     they are the single nearest person very often, and exposure to them depends on how the kit clustering fell - this
     was measurable in the simulator and produced a 10-point swing.
+
+    Returns ``(buckets, coverage)``. ``coverage`` counts the frames each measurement decided, so the report can say
+    how much of possession is image-space rather than merely asserting that the code supports it.
     """
     frames = np.unique(detections.frame[keep])
     if len(frames) == 0:
-        return {}
+        return {}, {"image_available_frames": 0, "image_contested_frames": 0, "aim_contested_frames": 0}
     buckets: dict[int, dict] = {}
+    coverage = {"image_available_frames": 0, "image_contested_frames": 0, "aim_contested_frames": 0}
     progress_every = max(1, len(frames) // 25)
     for index, frame in enumerate(frames):
         if on_progress is not None and (index % progress_every == 0 or index == len(frames) - 1):
@@ -748,14 +763,30 @@ def _momentum(
         minute = int(detections.time[rows[0]] // bucket_s)
         entry = buckets.setdefault(minute, {"won": [0, 0], "x": [], "uncontested": 0})
         entry["x"].append(float(aim[0]))
+        image_here = (
+            ball_image is not None
+            and frame < ball_image.frames
+            and bool(ball_image.valid[frame])
+            and np.isfinite(ball_image.u[frame])
+        )
+        if image_here:
+            coverage["image_available_frames"] += 1
         if not players.any():
             entry["uncontested"] += 1
             continue
-        distance = np.linalg.norm(detections.xy[rows] - aim[None, :], axis=1)
-        distance = np.where(players, distance, np.inf)
+        if image_here:
+            distance = foot_distance(
+                detections.box[rows], float(ball_image.u[frame]), float(ball_image.v[frame])
+            )
+            gate = POSSESSION_IMAGE_RADIUS
+        else:
+            distance = np.linalg.norm(detections.xy[rows] - aim[None, :], axis=1)
+            gate = possession_radius_m
+        distance = np.where(players & np.isfinite(distance), distance, np.inf)
         nearest = int(np.argmin(distance))
-        if distance[nearest] <= possession_radius_m:
+        if distance[nearest] <= gate:
             entry["won"][int(teams[nearest])] += 1
+            coverage["image_contested_frames" if image_here else "aim_contested_frames"] += 1
         else:
             entry["uncontested"] += 1
     out = {}
@@ -771,7 +802,25 @@ def _momentum(
             "contested_frames": int(total),
             "uncontested_frames": int(entry["uncontested"]),
         }
-    return dict(sorted(out.items()))
+    return dict(sorted(out.items())), coverage
+
+
+def _possession_from_momentum(momentum: dict) -> float:
+    """Team 0's share of contested frames across the whole match.
+
+    The per-minute buckets are the right resolution for the momentum curve, but averaging their shares would
+    give a minute with one contested frame the same weight as a minute with hundreds. Match possession is time
+    in control, so the buckets are combined by their contested-frame counts - the convention a broadcast
+    possession split uses. Returns 0.0 when nothing was contested.
+    """
+    contested = sum(int(bucket.get("contested_frames", 0)) for bucket in momentum.values())
+    if contested <= 0:
+        return 0.0
+    won = sum(
+        float(bucket.get("team_0", 0.0)) * int(bucket.get("contested_frames", 0))
+        for bucket in momentum.values()
+    )
+    return won / contested
 
 
 def _weak_labels(teams: dict[int, int], quality: dict[int, float]) -> list[int]:
@@ -790,11 +839,15 @@ def build_report(
     pitch_length_m: float,
     pitch_width_m: float,
     match_frames: int | None = None,
+    ball_image: BallImage | None = None,
     on_progress=None,
 ) -> tuple[MatchReport, TrackAssignment]:
     """Full Stage B pipeline: mask -> track -> stitch fragments -> team -> metrics -> momentum.
 
-    ``on_progress(fraction)`` covers the whole pipeline (tracking is the long part; teams and metrics are quick).
+    ``ball_image`` is the optional per-frame ball position from the ball scan (``ball_image_from_scan``) or the
+    gimbal lock. Where it has a position, possession is decided in the picture; elsewhere it falls back to the
+    camera aim point in pitch space. ``on_progress(fraction)`` covers the whole pipeline (tracking is the long
+    part; teams and metrics are quick).
     """
     def report(fraction: float) -> None:
         if on_progress is not None:
@@ -809,10 +862,12 @@ def build_report(
     players = build_tracks(detections, keep, assignment, teams)
     report(0.7)
 
-    momentum = _momentum(detections, keep, teams, assignment.track_id, on_progress=lambda f: report(0.7 + 0.25 * f))
+    momentum, possession_coverage = _momentum(
+        detections, keep, teams, assignment.track_id, ball_image=ball_image,
+        on_progress=lambda f: report(0.7 + 0.25 * f),
+    )
     summary: list[TeamMetrics] = []
-    shares = [momentum[m]["team_0"] for m in momentum] if momentum else []
-    mean_share = float(np.mean(shares)) if shares else 0.0
+    mean_share = _possession_from_momentum(momentum)
     for team in (0, 1):
         members = [p for p in players if p.team == team]
         if members:
@@ -824,7 +879,7 @@ def build_report(
         else:
             distance = mean_x = 0.0
             moving = np.zeros(1)
-        possession = mean_share if team == 0 else (1.0 - mean_share if shares else 0.0)
+        possession = mean_share if team == 0 else (1.0 - mean_share if momentum else 0.0)
         summary.append(
             TeamMetrics(
                 team=team,
@@ -837,12 +892,45 @@ def build_report(
                 kit_rgb=kit_rgb(kit_colors.get(team)),
             )
         )
+    image_contested = int(possession_coverage["image_contested_frames"])
+    aim_contested = int(possession_coverage["aim_contested_frames"])
+    contested = image_contested + aim_contested
+    image_share = image_contested / contested if contested else 0.0
+    source = ball_image.source if ball_image is not None else "camera aim"
+    possession_meta = {
+        "space": "mixed" if image_contested and aim_contested else ("image" if image_contested else "pitch"),
+        "source": source,
+        "image_available_frames": int(possession_coverage["image_available_frames"]),
+        "image_contested_frames": image_contested,
+        "aim_contested_frames": aim_contested,
+        "contested_frames": contested,
+        "image_share": round(image_share, 3),
+    }
     notes = []
     if not any(p.team >= 0 for p in players):
         notes.append("Kit colors were not separable: team metrics are unavailable for this match.")
     weak = _weak_labels(teams, quality)
     if weak:
         notes.append(f"{len(weak)} track(s) had weakly separated kit colors; their team label is a best guess.")
+    if image_contested and aim_contested:
+        notes.append(
+            f"Possession is measured in image space from the {source} on {image_share:.0%} of contested frames; "
+            "the rest use the camera aim point as a pitch-space ball proxy."
+        )
+    elif image_contested:
+        notes.append(
+            "Possession is measured in image space - the nearest player's foot to the ball in the picture - so it "
+            "does not depend on the pitch calibration."
+        )
+    elif ball_image is not None:
+        notes.append(
+            "A ball scan was provided but did not produce a contested image-space frame; possession fell back to "
+            "the camera aim point."
+        )
+    else:
+        notes.append(
+            "Possession uses the camera aim point as a ball proxy; run the ball scan to measure it in image space."
+        )
     notes.append(
         "Goals, shots, corners, penalties, clearances and tackles can be inferred from the ball scan and these "
         "tracks (the playback's own Detect events button, or the one-press build in Step 3); saves and blocks stay "
@@ -859,6 +947,7 @@ def build_report(
             pitch_width_m=pitch_width_m,
             frames_analyzed=int(match_frames or (int(detections.frame.max()) + 1 if len(detections.frame) else 0)),
             detections_used=int(keep.sum()),
+            possession=possession_meta,
             notes=notes,
         ),
         assignment,

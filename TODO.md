@@ -8,6 +8,8 @@
 - [x] Make homography-driven field lines more stable and keep them in sync with the optical-flow video motion
   (zero-phase smoothing of the log-backed pose and optical-flow focal chain, used by projections, the pitch
   animation and the stream overlay)
+- [x] Measure possession in image space from the ball scan (nearest player's foot to the ball in the picture),
+  with the camera aim point as the fallback when no scan position exists
 
 ## Remaining
 Nothing currently.

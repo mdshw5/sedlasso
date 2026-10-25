@@ -20,13 +20,14 @@ import numpy as np
 from soccer_analytics.analysis import event_detection, stage_b
 from soccer_analytics.analysis import game as game_lib
 from soccer_analytics.analysis import roles as roles_lib
+from soccer_analytics.analysis.ball_lock import BallImage, POSSESSION_IMAGE_RADIUS
 from soccer_analytics.analysis.events import EVENT_TYPES, Event, same_recording
 from soccer_analytics.analysis.stage_b import PlayerTrack
 from soccer_analytics.dashboard.reports import team_name
 
-# A player is "on the ball" when they are the nearest player to the camera's aim point and within this distance.
-# Same gate as stage_b's momentum: the aim point is a ball proxy, not the scanned ball - a touch here means
-# "nearest to where the camera was pointed", and it is labeled that way in the UI.
+# Pitch-space possession gate for the fallback path: a player is on the ball when they are the nearest player to
+# the camera's aim point and within this distance. When the ball scan supplies an image position, the image-space
+# gate (``ball_lock.POSSESSION_IMAGE_RADIUS``) is used instead and this distance is not involved.
 POSSESSION_RADIUS_M = 12.0
 ROUND_M = 0.1
 
@@ -267,6 +268,74 @@ def roles_and_attack(
     return roles, attack_summary(orientations, half_frame=half_frame)
 
 
+def _touch_counts(
+    players: Sequence[PlayerTrack],
+    aim: list[list[float] | None],
+    ball_image: BallImage | None,
+) -> tuple[dict[int, int], dict]:
+    """Per-player touch counts, preferring the scanned ball's picture position over the aim proxy.
+
+    A touch is the frame's nearest player to the ball when the ball was measured in the picture (the scan's
+    ``tracking``/``coasting`` position), else the nearest to the camera's aim point in pitch space. Either way the
+    player must be within the possession gate. Returns ``(touches by track id, coverage metadata)`` so the payload
+    can say which measurement produced the column rather than calling both "proxy".
+    """
+    by_frame: dict[int, list[tuple[int, float, float, float, float]]] = {}
+    for track in players:
+        boxes = track.box
+        for index, (frame, position) in enumerate(zip(track.frame, track.xy)):
+            foot_u = foot_v = float("nan")
+            if boxes is not None and index < len(boxes):
+                foot_u = float((boxes[index, 0] + boxes[index, 2]) / 2.0)
+                foot_v = float(boxes[index, 3])
+            by_frame.setdefault(int(frame), []).append(
+                (int(track.track_id), float(position[0]), float(position[1]), foot_u, foot_v)
+            )
+
+    touches: dict[int, int] = {}
+    image_touches = pitch_touches = 0
+    for frame, entries in by_frame.items():
+        if frame >= len(aim) or aim[frame] is None:
+            continue
+        ax, ay = aim[frame]
+        image_here = (
+            ball_image is not None
+            and frame < ball_image.frames
+            and bool(ball_image.valid[frame])
+            and np.isfinite(ball_image.u[frame])
+        )
+        if image_here:
+            u, v = float(ball_image.u[frame]), float(ball_image.v[frame])
+            feet = np.asarray([[entry[3], entry[4]] for entry in entries], dtype=np.float64)
+            usable = np.isfinite(feet).all(axis=1)
+            if usable.any():
+                distance = np.full(len(entries), np.inf, dtype=np.float64)
+                if np.isfinite(v):
+                    distance[usable] = np.hypot(feet[usable, 0] - u, feet[usable, 1] - v)
+                else:
+                    distance[usable] = np.abs(feet[usable, 0] - u)
+                gate = POSSESSION_IMAGE_RADIUS
+            else:
+                image_here = False
+        if not image_here:
+            distance = np.array([np.hypot(x - ax, y - ay) for _tid, x, y, _u, _v in entries])
+            gate = POSSESSION_RADIUS_M
+        best = int(np.argmin(distance))
+        if distance[best] <= gate:
+            track_id = entries[best][0]
+            touches[track_id] = touches.get(track_id, 0) + 1
+            if image_here:
+                image_touches += 1
+            else:
+                pitch_touches += 1
+    space = "mixed" if image_touches and pitch_touches else ("image" if image_touches else "pitch")
+    return touches, {
+        "space": space,
+        "image_touches": image_touches,
+        "pitch_touches": pitch_touches,
+    }
+
+
 def build_replay(
     pitch: tuple[float, float],
     fps: float,
@@ -275,12 +344,13 @@ def build_replay(
     players: list[PlayerTrack],
     team_names: list[str],
     ball: tuple[np.ndarray, np.ndarray] | None = None,
+    ball_image: BallImage | None = None,
     team_colors: Sequence[Sequence[int] | None] | None = None,
     camera_xy: Sequence[float] | None = None,
     roles: dict[int, dict] | None = None,
     attack: dict | None = None,
 ) -> dict:
-    """Assemble the replay payload from tracks, the per-frame camera aim (ball proxy) and the ball track.
+    """Assemble the replay payload from tracks, the per-frame camera aim, the ball track and its image positions.
 
     Shirt numbers are deliberately *not* baked in here: they come from the roster and the scanner and are passed to
     the component as a small argument, so editing a roster updates the view without rebuilding the replay. Players
@@ -289,7 +359,9 @@ def build_replay(
     ``ball`` is the optional ``(xy (F, 2), measured (F,))`` pair from ``projection.project_ball_track`` (the ball
     scan, when one has run): NaN rows become ``null``, and the ``measured`` flag rides along as a third element so
     the view can draw a detection differently from a forecast across a missed frame - the scan's own honesty rule,
-    kept through to the last consumer.
+    kept through to the last consumer. ``ball_image`` is the same scan's per-frame picture position (or the gimbal
+    lock's); where it has a position, per-player touches are measured in image space instead of around the aim
+    point, and the payload records which measurement supplied them.
 
     ``team_colors`` is each team's measured kit color as ``(r, g, b)``, ``None`` where the clustering could not
     separate the kits: the component paints its markers with the color that was actually on the pitch, and keeps
@@ -321,33 +393,26 @@ def build_replay(
             for (x, y), m in zip(ball_xy, ball_measured)
         ]
 
-    # Who was on the ball each frame, by proximity to the camera's aim point (the same proxy stage_b uses).
-    # Bystanders are excluded first: they are not players, and counting their proximity to the aim point
-    # would credit touches to people who cannot touch a ball. Role-labeled tracks are never bystanders,
-    # however still they stand: keepers hang around one goal and drift little, which trips the "small AND still"
-    # rule measured on sideline crowds - but a keeper is exactly who must be drawn (15 of 28 role tracks were
-    # being dropped from the payload before this).
+    # Who was on the ball each frame: the scanned ball's picture position where one exists, else the camera's aim
+    # point (the same fallback stage_b uses). Bystanders are excluded first: they are not players, and counting
+    # their proximity to the ball would credit touches to people who cannot touch one. Role-labeled tracks are
+    # never bystanders, however still they stand: keepers hang around one goal and drift little, which trips the
+    # "small AND still" rule measured on sideline crowds - but a keeper is exactly who must be drawn (15 of 28
+    # role tracks were being dropped from the payload before this).
     field_players = [
         track
         for track in players
         if (roles is not None and int(track.track_id) in roles) or not _is_bystander(track)
     ]
-    by_frame: dict[int, list[tuple[int, float, float]]] = {}
-    for track in field_players:
-        for frame, position in zip(track.frame, track.xy):
-            by_frame.setdefault(int(frame), []).append((int(track.track_id), float(position[0]), float(position[1])))
-    touches: dict[int, int] = {}
-    for frame, entries in by_frame.items():
-        if frame >= len(aim) or aim[frame] is None:
-            continue
-        ax, ay = aim[frame]
-        best_track, best_distance = None, POSSESSION_RADIUS_M
-        for track_id, x, y in entries:
-            distance = float(np.hypot(x - ax, y - ay))
-            if distance <= best_distance:
-                best_track, best_distance = track_id, distance
-        if best_track is not None:
-            touches[best_track] = touches.get(best_track, 0) + 1
+    # Stage B already refuses to let the referee win a possession frame. Do the same for the per-player touch
+    # counts: the referee follows the ball all match, so counting them would make the official look like the
+    # busiest player on the pitch. Keepers are players and stay eligible.
+    touchers = [
+        track
+        for track in field_players
+        if not (roles is not None and roles.get(int(track.track_id), {}).get("role") == "referee")
+    ]
+    touches, possession_meta = _touch_counts(touchers, aim, ball_image)
 
     out_players = []
     for track in sorted(field_players, key=lambda item: int(item.track_id)):
@@ -388,6 +453,9 @@ def build_replay(
         "ball": ball_out,
         "players": out_players,
         "attack": attack,
+        # How the touch counts were measured: "image" (the scanned ball in the picture), "mixed" (image where the
+        # scan had a position, aim elsewhere), or "pitch" (aim only). Older payloads have no such block.
+        "possession": possession_meta,
         # How many tracked people were judged bystanders (touchline coaches, photographers, spectators) and
         # left out of ``players``. The view draws the field of play only; the count keeps the exclusion honest
         # - the page can say how many tracked people are not shown rather than silently shrinking the world.
@@ -422,7 +490,7 @@ def player_table_rows(replay: dict, numbers: dict[int, dict] | None = None):  # 
                 "distance (m)": stats["distance_m"],
                 "top speed (km/h)": stats["top_speed_kmh"],
                 "mean speed (km/h)": stats["mean_speed_kmh"],
-                "touches (proxy)": stats["touches"],
+                "touches": stats["touches"],
                 "mean x (m)": stats["mean_x"],
                 "mean y (m)": stats["mean_y"],
             }
