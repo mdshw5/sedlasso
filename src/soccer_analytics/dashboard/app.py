@@ -45,8 +45,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from soccer_analytics.analysis import game as game_lib
 from soccer_analytics.analysis import identity as identity_lib
-from soccer_analytics.analysis import stage_a, stage_b
-from soccer_analytics.analysis.ball_lock import ball_image_from_scan
+from soccer_analytics.analysis import stage_a
 from soccer_analytics.analysis import detect_run
 from soccer_analytics.analysis.events import (
     MIN_PROMINENCE,
@@ -58,28 +57,21 @@ from soccer_analytics.analysis.framing import COMMAND_RATE_HZ, SHORTEST_CLIP_SEC
 from soccer_analytics.analysis.highlights import (
     TIER_SECONDS,
     build_moments,
-    export_player_clip,
-    export_reel,
     moment_for_event,
     select_reel,
-    write_manifest,
 )
 from soccer_analytics.analysis.library import (
     MatchLibrary,
     analysis_dir_for,
     discover_videos,
     segments_root_for,
+    upgrade_report_payload,
     upgrade_replay_payload,
     video_roots,
 )
 from soccer_analytics.analysis.kit import color_hex, color_name, suggest_team_name
 from soccer_analytics.analysis.jerseys import merge_numbers
-from soccer_analytics.analysis.projection import (
-    fit_segment_pan_axis,
-    project_ball_track,
-    project_segment,
-    segment_poses,
-)
+from soccer_analytics.analysis.projection import fit_segment_pan_axis, segment_poses
 from soccer_analytics.analysis.rosters import RosterLibrary, team_rosters_for
 from soccer_analytics.analysis.stage_a import SegmentConfig, load_segment, read_status, resolve_window, segment_dir_for
 from soccer_analytics.geometry.gimbal_motion import (
@@ -123,20 +115,17 @@ from soccer_analytics.dashboard.reports import (
     colors_were_recorded,
     is_default_team_name,
     momentum_on_window_clock,
-    report_from_library,
     team_colors,
     team_name,
 )
+from soccer_analytics.dashboard import job_ui, jobs
 from soccer_analytics.dashboard.replay import (
     aiming_goal,
-    build_replay,
     deleted_events,
     event_from_tag,
     event_play,
     player_table_rows,
     repeated_manual_tag,
-    roles_and_attack,
-    track_boxes,
 )
 from soccer_analytics.dashboard.stream import configured_base, configured_port, is_reachable
 from soccer_analytics.geometry.pitch_calibration import (
@@ -672,6 +661,35 @@ def _load_replay_cached(path: str, mtime_ns: int) -> dict:
     return upgrade_replay_payload(json.loads(Path(path).read_text()))
 
 
+@st.cache_data(show_spinner=False)
+def _load_report_cached(path: str, mtime_ns: int) -> dict:
+    """Parse the report once per file version, restoring its minute keys to integers."""
+    del mtime_ns
+    payload = upgrade_report_payload(json.loads(Path(path).read_text()))
+    momentum = {}
+    for key, value in (payload.get("momentum") or {}).items():
+        try:
+            momentum[int(key)] = value
+        except (TypeError, ValueError):
+            continue
+    payload["momentum"] = momentum
+    return payload
+
+
+def _report_payload(library: MatchLibrary, match_id: str | None) -> dict | None:
+    """The saved report, cached until the file changes; the payload is tens of megabytes."""
+    if match_id is None:
+        return None
+    path = library.path(match_id) / "report.json"
+    if not path.exists():
+        return None
+    try:
+        mtime = path.stat().st_mtime_ns
+    except OSError:
+        return None
+    return _load_report_cached(str(path), mtime)
+
+
 BALL_STATUS_FILE = "ball_scan.json"  # written by scripts/run_ball_scan.py beside the segment
 BALL_TRACK_FILE = "ball_track.json"  # the scan's result, beside the status
 JERSEY_STATUS_FILE = "jerseys_status.json"  # written by scripts/extract_jerseys.py beside the match
@@ -705,117 +723,49 @@ def _ball_scan_alive(segment_dir: Path) -> bool:
     return _scan_alive(_ball_status(segment_dir))
 
 
-def _ball_scan_records(segment_dir: Path) -> list[dict] | None:
-    """The segment's raw ball scan records, or None when it has not been scanned.
-
-    A partial scan is used as it stands: the report measures possession on the frames the scan has reached and the
-    replay draws them, and the scan's own status line says whether it is finished. A scan that lands after the
-    report was built shows up on the next build - which is cheap, so the page tells the user to press it again
-    rather than rebuilding behind their back.
-    """
+def _queue_status(path: Path, *, message: str, **extra) -> None:
+    """Mark a scan's own status file queued before the worker replaces it with "running"."""
     try:
-        payload = json.loads((Path(segment_dir) / BALL_TRACK_FILE).read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
-    records = payload.get("frames") or []
-    return records or None
+        Path(path).write_text(
+            json.dumps({"state": "queued", "message": message, "updated": time.time(), **extra})
+        )
+    except OSError:
+        pass  # an unwritable directory fails the child too, and its error lands in its status
 
 
-def _ball_track_for_replay(
-    records: list[dict] | None, calibration: PitchCalibration, q: np.ndarray, focal: np.ndarray
-):  # noqa: ANN201 - (xy (F,2), measured (F,)) from project_ball_track, or None
-    """The segment's ball scan projected into pitch meters, or None when there are no records."""
-    if not records:
-        return None
-    return project_ball_track(records, calibration, q, focal)
+def _library_root(library: MatchLibrary) -> str | None:
+    """The explicit matches root, when the page was given one; None means the worker discovers the usual roots."""
+    return str(library.root) if library.root is not None else None
 
 
-def _build_report_and_replay(
+def _submit_report_job(
     library: MatchLibrary,
     match_id: str,
-    segment,
     segment_dir: Path,
-    calibration: PitchCalibration,
-    q: np.ndarray,
-    focal: np.ndarray,
-) -> None:
-    """Project, track, and save the report and the replay - the work behind both build buttons.
-
-    The pipeline reports fractions of its own work; the bar maps them onto the whole job so it is one honest line
-    from 0 to 100 instead of three bars that each restart. The replay needs the same tracks the report was built
-    from, so it is built here rather than in a second pass over the segment.
-    """
-    record = library.load(match_id)
-    length_m, width_m = record.pitch_length_m, record.pitch_width_m
-    report_box = st.status("Building the report and the replay...", expanded=True)
-    bar = st.progress(0.0, text="Projecting detections to the pitch...")
-    advance = progress_reporter(bar, "Building the report...")
-    with report_box:
-        detections = project_segment(
-            segment,
-            calibration,
-            on_progress=lambda fraction: advance(0.40 * fraction, "Projecting detections to the pitch..."),
+    *,
+    with_detections: bool = False,
+    video: str = "",
+    strictness: float = MIN_PROMINENCE,
+    keep_voices: bool = True,
+) -> dict:
+    """Queue a report build (or the report followed by the full detection chain) and return its status."""
+    kind = "build_and_detect" if with_detections else "report"
+    label = "Report + all detections" if with_detections else "Report + replay"
+    params = {
+        "match_id": str(match_id),
+        "segment_dir": str(segment_dir),
+        "library_root": _library_root(library),
+    }
+    if with_detections:
+        params.update(
+            video=str(video), strictness=float(strictness), keep_voices=bool(keep_voices)
         )
-        ball_records = _ball_scan_records(segment_dir)
-        ball_image = ball_image_from_scan(ball_records, len(segment.time)) if ball_records else None
-        report, assignment = stage_b.build_report(
-            detections,
-            pitch_length_m=length_m,
-            pitch_width_m=width_m,
-            match_frames=len(segment.time),
-            ball_image=ball_image,
-            on_progress=lambda fraction: advance(
-                0.40 + 0.45 * fraction, "Tracking players, teams and momentum..."
-            ),
-        )
-        advance(0.88, "Building the replay...")
-        ball = _ball_track_for_replay(ball_records, calibration, q, focal)
-        roles, attack = roles_and_attack(
-            report, detections, assignment, segment=segment, pitch_length_m=length_m,
-            swap_attack=bool(record.swap_attack),
-        )
-        replay = build_replay(
-            (length_m, width_m),
-            float(segment.meta["fps"]),
-            len(segment.time),
-            detections.aim_xy,
-            report.players,
-            record.team_names,
-            ball=ball,
-            ball_image=ball_image,
-            team_colors=[metrics.kit_rgb for metrics in report.teams],
-            camera_xy=detections.camera_xy,
-            roles=roles,
-            attack=attack,
-        )
-        advance(0.97, "Saving the report and the replay...")
-        st.session_state["report"] = {
-            "teams": [vars(team) for team in report.teams],
-            "players": [
-                {
-                    "track_id": player.track_id,
-                    "team": player.team,
-                    "observations": len(player.frame),
-                    "distance_m": round(player.distance_m, 1),
-                    "top_speed_kmh": round(float(player.speed_kmh.max()), 1),
-                    "xy": [[round(float(x), 1), round(float(y), 1)] for x, y in player.xy],
-                }
-                for player in report.players
-            ],
-            "momentum": report.momentum,
-            "possession": report.possession,
-            "notes": report.notes,
-            "pitch": [length_m, width_m],
-            "detections_used": report.detections_used,
-            "frames_analyzed": report.frames_analyzed,
-        }
-        library.save_report(match_id, st.session_state["report"])
-        library.save_replay(match_id, replay, boxes=track_boxes(report.players))
-    advance(1.0, "Report and replay built.")
-    report_box.update(
-        label=f"Report built: {len(report.players)} tracks, {len(report.teams)} teams, replay ready",
-        state="complete",
-        expanded=False,
+    return jobs.JOBS.submit(
+        kind=kind,
+        label=label,
+        match_id=match_id,
+        params=params,
+        resources=("gpu",) if with_detections else (),
     )
 
 
@@ -877,35 +827,25 @@ def _start_video_export(
         "numbers": bool(numbers),
     }
     status_path = library.path(match_id) / VIDEO_EXPORT_STATUS_FILE
-    try:
-        status_path.write_text(
-            json.dumps(
-                {
-                    "state": "running",
-                    "stage": "prepare",
-                    "progress": 0.0,
-                    "message": "Starting...",
-                    "output": str(output),
-                    "width": int(width),
-                    "fps": float(fps),
-                    "codec": codec,
-                    "overlays": overlays,
-                    "started": time.time(),
-                    "updated": time.time(),
-                }
-            )
-        )
-    except OSError:
-        pass  # an unwritable match directory fails the child too, and its error lands in its status
-    try:
-        subprocess.Popen(command, cwd=str(REPO_ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except OSError as exc:  # e.g. the interpreter vanished between the page load and the click
-        try:
-            status_path.write_text(
-                json.dumps({"state": "error", "message": f"could not start: {exc}", "updated": time.time()})
-            )
-        except OSError:
-            pass
+    _queue_status(
+        status_path,
+        message="Queued - the job manager will start the export.",
+        stage="prepare",
+        progress=0.0,
+        output=str(output),
+        width=int(width),
+        fps=float(fps),
+        codec=codec,
+        overlays=overlays,
+    )
+    jobs.JOBS.submit(
+        kind="video_export",
+        label="Video export",
+        match_id=match_id,
+        argv=command,
+        watch=status_path,
+        resources=(),
+    )
 
 
 def _detections_status(library: MatchLibrary, match_id: str) -> dict:
@@ -919,43 +859,6 @@ def _detections_status(library: MatchLibrary, match_id: str) -> dict:
 def _detections_alive(library: MatchLibrary, match_id: str) -> bool:
     """Whether the enrichment run is in progress, not just leaving "running" behind after a crash."""
     return _scan_alive(_detections_status(library, match_id))
-
-
-def _start_all_detections(library: MatchLibrary, match_id: str, video: str, segment_dir: Path) -> None:
-    """Start the enrichment pipeline - the scans, the detectors and the rebuild - as its own process.
-
-    The same settings the individual scan controls show are baked into the command, because the background process
-    reads nothing from this session. Each stage checks its own previous result, so pressing this again after a
-    failure resumes rather than redoing the hour-long ball scan.
-    """
-    command = [
-        sys.executable,
-        str(REPO_ROOT / "scripts" / "run_detections.py"),
-        "--match", match_id,
-        "--video", str(video),
-        "--segment", str(segment_dir),
-        "--strictness", f"{float(st.session_state.get('whistle_strictness', MIN_PROMINENCE)):.1f}",
-    ]
-    if not st.session_state.get("whistle_reject_voices", True):
-        command.append("--keep-voices")
-    # The child takes a moment to boot and write its first status; writing the same "starting" payload now closes
-    # the window where the button still looks pressable and a second click would race the first run.
-    status_path = library.path(match_id) / DETECTIONS_STATUS_FILE
-    try:
-        status_path.write_text(
-            json.dumps(
-                {
-                    "state": "running",
-                    "stage": "ball",
-                    "progress": 0.0,
-                    "message": "Starting all detections...",
-                    "updated": time.time(),
-                }
-            )
-        )
-    except OSError:
-        pass  # an unwritable match directory fails the child too, and its error lands in the status file
-    subprocess.Popen(command, cwd=str(REPO_ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def _start_ball_scan(library: MatchLibrary, match_id: str, segment, segment_dir: Path, video: str) -> None:
@@ -978,17 +881,15 @@ def _start_ball_scan(library: MatchLibrary, match_id: str, segment, segment_dir:
         "--video",
         scan_video,
     ]
-    try:
-        status_path.write_text(json.dumps({"state": "running", "message": "Starting...", "updated": time.time()}))
-    except OSError:
-        pass  # an unwritable segment directory fails the child too, and its error lands in the terminal
-    try:
-        subprocess.Popen(command, cwd=str(REPO_ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except OSError as exc:  # e.g. the interpreter vanished between the page load and the click
-        try:
-            status_path.write_text(json.dumps({"state": "error", "error": str(exc), "updated": time.time()}))
-        except OSError:
-            pass
+    _queue_status(status_path, message="Queued - the job manager will start the ball scan.")
+    jobs.JOBS.submit(
+        kind="ball_scan",
+        label="Ball scan",
+        match_id=match_id,
+        argv=command,
+        watch=status_path,
+        resources=("gpu",),
+    )
 
 
 def _start_jersey_scan(library: MatchLibrary, match_id: str, segment, segment_dir: Path, video: str) -> None:
@@ -1010,31 +911,21 @@ def _start_jersey_scan(library: MatchLibrary, match_id: str, segment, segment_di
         "--video", scan_video,
         "--segment", str(segment_dir),
     ]
-    try:
-        status_path.write_text(
-            json.dumps(
-                {
-                    "state": "running",
-                    "crops_total": 0,
-                    "crops_done": 0,
-                    "readings": 0,
-                    "message": "Starting...",
-                    "started": time.time(),
-                    "updated": time.time(),
-                }
-            )
-        )
-    except OSError:
-        pass  # an unwritable match directory fails the child too, and its error lands in its status
-    try:
-        subprocess.Popen(command, cwd=str(REPO_ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except OSError as exc:  # e.g. the interpreter vanished between the page load and the click
-        try:
-            status_path.write_text(
-                json.dumps({"state": "error", "message": f"could not start: {exc}", "updated": time.time()})
-            )
-        except OSError:
-            pass
+    _queue_status(
+        status_path,
+        message="Queued - the job manager will start the shirt-number scan.",
+        crops_total=0,
+        crops_done=0,
+        readings=0,
+    )
+    jobs.JOBS.submit(
+        kind="jersey_scan",
+        label="Shirt numbers",
+        match_id=match_id,
+        argv=command,
+        watch=status_path,
+        resources=("gpu",),
+    )
 
 
 def _start_audio_scan(library: MatchLibrary, match_id: str, video: str) -> None:
@@ -1057,48 +948,17 @@ def _start_audio_scan(library: MatchLibrary, match_id: str, video: str) -> None:
     if not st.session_state.get("whistle_reject_voices", True):
         command.append("--keep-voices")
     status_path = library.path(match_id) / AUDIO_STATUS_FILE
-    try:
-        status_path.write_text(
-            json.dumps(
-                {
-                    "state": "running",
-                    "stage": "extract",
-                    "progress": 0.0,
-                    "message": "Starting...",
-                    "started": time.time(),
-                    "updated": time.time(),
-                }
-            )
-        )
-    except OSError:
-        pass  # an unwritable match directory fails the child too, and its error lands in its status
-    try:
-        subprocess.Popen(command, cwd=str(REPO_ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except OSError as exc:  # e.g. the interpreter vanished between the page load and the click
-        try:
-            status_path.write_text(
-                json.dumps({"state": "error", "error": f"could not start: {exc}", "updated": time.time()})
-            )
-        except OSError:
-            pass
-
-
-def _clip_offsets(video: str) -> dict[str, float]:
-    """Where each of the game's clips starts inside ``video``, for mapping a moment onto the file being cut.
-
-    A moment's seconds are seconds of its own recording: a whistle candidate was scanned on a single camera file,
-    a detected event on the combined game. When the reel is cut from the selected video, the window has to be
-    translated through the game manifest or the clip shows the wrong part of the match. Empty when ``video`` is not
-    a combined game (a single clip has nothing to map) or the manifest cannot be read.
-    """
-    record = game_lib.find_for_video(video)
-    if record is None or len(record.clips) < 2:
-        return {}
-    return {
-        str(Path(clip.path).resolve()): float(clip.start_s)
-        for clip in record.clips
-        if Path(clip.path).exists()
-    }
+    _queue_status(
+        status_path, message="Queued - the job manager will start the whistle scan.", stage="extract", progress=0.0
+    )
+    jobs.JOBS.submit(
+        kind="audio_scan",
+        label="Whistle scan",
+        match_id=match_id,
+        argv=command,
+        watch=status_path,
+        resources=(),
+    )
 
 
 def _footage_moment(
@@ -1222,24 +1082,6 @@ def frame_cached(video: str, time_s: float, width: int):  # noqa: ANN201 - a sha
     return grab_frame(video, time_s, width=width)
 
 
-def progress_reporter(bar, label: str):  # noqa: ANN001, ANN201 - st.progress element and a callable back
-    """A throttled ``bar.progress`` updater for tasks that report often (the pipeline and ffmpeg do).
-
-    A repaint per callback would flood the websocket; two percent or half a second apart is smooth to the eye and
-    cheap. The final 100% always goes through.
-    """
-    state = {"last": 0.0, "fraction": -1.0}
-
-    def report(fraction: float, text: str | None = None) -> None:
-        fraction = min(1.0, max(0.0, float(fraction)))
-        now = time.time()
-        if fraction >= 1.0 or fraction - state["fraction"] >= 0.02 or now - state["last"] >= 0.5:
-            state["last"], state["fraction"] = now, fraction
-            bar.progress(fraction, text=text or label)
-
-    return report
-
-
 def timeline_ready(segment, segment_dir: Path) -> bool:
     """Whether the segment's scrub proxy is ready, starting the background build if it is not.
 
@@ -1306,7 +1148,9 @@ def _stage_a_status(segment_dir: Path, watch_key: str) -> None:
         st.info("Not analyzed yet.")
     else:
         st.write(f"Stage A: **{state}**, {status.get('frames_done', 0)}/{status.get('total_frames', 0)} frames")
-        if state == "running":
+        if state == "queued":
+            st.info("Queued - the job manager will start the analysis when a slot is free.")
+        elif state == "running":
             fraction = status.get("frames_done", 0) / max(1, status.get("total_frames", 1))
             detail = f"{status.get('fps', 0):.1f} analyzed fps"
             eta = status.get("eta_s")
@@ -1547,7 +1391,13 @@ def fit_message(calibration: PitchCalibration, labeled: list[tuple[dict, str]]) 
     return message
 
 
-_SCAN_STATE_WORDS = {"running": "running", "done": "done", "error": "failed", "partial": "stopped early"}
+_SCAN_STATE_WORDS = {
+    "queued": "queued",
+    "running": "running",
+    "done": "done",
+    "error": "failed",
+    "partial": "stopped early",
+}
 
 
 def _scan_row(title: str, state: str | None):
@@ -1590,6 +1440,8 @@ def scan_activity_section(
     with _scan_row("Ball scan", ball.get("state")):
         if not ball:
             st.caption("Not scanned yet - about an hour on a whole game.")
+        elif ball.get("state") == "queued":
+            st.caption("Queued - it will start when the job manager has a free slot.")
         elif ball.get("state") == "running":
             if _scan_alive(ball):
                 st.progress(
@@ -1628,7 +1480,7 @@ def scan_activity_section(
         if st.button(
             "Scan for the ball (background)",
             key=f"scan_ball::{match_id}",
-            disabled=_ball_scan_alive(segment_dir),
+            disabled=_ball_scan_alive(segment_dir) or jobs.JOBS.has_active(match_id, kinds=("ball_scan",)),
             help="Follows the ball frame by frame at full resolution. It checkpoints, so a stopped scan resumes.",
         ):
             _start_ball_scan(library, match_id, segment, segment_dir, video)
@@ -1642,6 +1494,8 @@ def scan_activity_section(
     with _scan_row("Whistle scan", audio.get("state")):
         if not audio:
             st.caption("Not scanned yet - decodes the recording's audio once, then looks for whistle blasts.")
+        elif audio.get("state") == "queued":
+            st.caption("Queued - it will start when the job manager has a free slot.")
         elif audio.get("state") == "running":
             if _scan_alive(audio):
                 st.progress(
@@ -1701,7 +1555,7 @@ def scan_activity_section(
         if st.button(
             "Scan audio for whistles (background)",
             key=f"scan_audio::{match_id}",
-            disabled=_scan_alive(audio),
+            disabled=_scan_alive(audio) or jobs.JOBS.has_active(match_id, kinds=("audio_scan",)),
             help="Searches the whistle band for loud, sustained blasts; the settings above travel with the run.",
         ):
             _start_audio_scan(library, match_id, video)
@@ -1715,6 +1569,8 @@ def scan_activity_section(
     with _scan_row("Shirt numbers", jersey.get("state")):
         if not jersey:
             st.caption("Not scanned yet - a few minutes of OCR over torso crops.")
+        elif jersey.get("state") == "queued":
+            st.caption("Queued - it will start when the job manager has a free slot.")
         elif jersey.get("state") == "running":
             if _scan_alive(jersey):
                 done, total = int(jersey.get("crops_done", 0)), int(jersey.get("crops_total", 0))
@@ -1738,7 +1594,7 @@ def scan_activity_section(
         if st.button(
             "Scan for shirt numbers (background)",
             key=f"scan_jerseys::{match_id}",
-            disabled=_scan_alive(jersey),
+            disabled=_scan_alive(jersey) or jobs.JOBS.has_active(match_id, kinds=("jersey_scan",)),
             help="Reads numbers off torso crops with OCR; only a number several readings agree on is reported.",
         ):
             _start_jersey_scan(library, match_id, segment, segment_dir, video)
@@ -1755,6 +1611,8 @@ def scan_activity_section(
                 "Not run yet - **Build report + run all detections** above chains the three scans, the event "
                 "detectors and a final rebuild, skipping whatever already finished."
             )
+        elif run.get("state") == "queued":
+            st.caption("Queued - it will start when the job manager has a free slot.")
         elif run.get("state") == "running":
             if _scan_alive(run):
                 st.progress(
@@ -2148,6 +2006,7 @@ def identity_section(
             cut = st.button(
                 "Cut the clip, centered on this player",
                 key=f"identity_cut::{match_id}",
+                disabled=jobs.JOBS.has_active(match_id, kinds=("player_clip",)),
                 help=(
                     "The clip is cut from the analyzed video with a moving crop that follows this appearance, sized "
                     "to the player's own height. Where the appearance has a gap of more than a couple of seconds "
@@ -2159,36 +2018,35 @@ def identity_section(
         legacy = library.highlights_dir(match_id) / "centred" / clip_name  # clips cut before the American spelling
         target = centered if centered.exists() or not legacy.exists() else legacy
         if cut and not target.exists():
-            bar = st.progress(0.0, text="Cutting the clip...")
-            reporter = progress_reporter(bar, "Cutting the clip...")
-            try:
-                probe = probe_cached(str(source))
-                _path, plan = export_player_clip(
-                    source,
-                    *chosen.trajectory(start_s=chosen.first_t),
-                    target,
-                    start_s=chosen.first_t,
-                    duration_s=duration,
-                    source_size=(probe.width, probe.height),
-                    width=1280,
-                    use_gpu=True,
-                    progress=reporter,
-                )
-                st.session_state[f"identity_plan::{match_id}"] = {
-                    "track": chosen.track_id, "duration": plan.duration_s, "truncated": plan.truncated,
-                }
-                reporter(1.0, "Clip ready")
-            except Exception as exc:  # a failed cut must not take the page down
-                st.error(f"Could not cut the clip: {exc}")
-                return
+            jobs.JOBS.submit(
+                kind="player_clip",
+                label=f"Clip for track {chosen.track_id}",
+                match_id=match_id,
+                params={
+                    "match_id": match_id,
+                    "library_root": _library_root(library),
+                    "source": str(source),
+                    "track_id": chosen.track_id,
+                    "first_t": chosen.first_t,
+                    "start_s": float(segment.meta.get("start_s", 0.0)),
+                    "duration_s": float(duration),
+                    "target": str(target),
+                    "width": 1280,
+                },
+            )
+            st.success("Clip queued - progress appears under Background jobs.")
         if target.exists():
             # A path, not the media URL the component would be given: `st.video` registers the file itself, and a
             # scheme-less ``/media/<hash>.mp4`` string is read as a *local* path, which fails with
             # MediaFileStorageError. The endpoint URL is only for callers that fetch it themselves (the replay
             # component's clip pane).
             st.video(str(target))
-            note = st.session_state.get(f"identity_plan::{match_id}") or {}
-            covers = float(note.get("duration") or duration) if note.get("track") == chosen.track_id else duration
+            plan_path = target.with_suffix(target.suffix + ".plan.json")
+            try:
+                note = json.loads(plan_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                note = {}
+            covers = float(note.get("duration") or duration)
             st.caption(
                 f"`{target.name}` - {_clock(chosen.first_t)} to {_clock(chosen.first_t + covers)}, cropped to "
                 "follow this player, cut from the analyzed video."
@@ -2270,7 +2128,7 @@ def replay_section(
     #   right of the events it belongs beside.
     # * the half-time mark is a game-clock time, so it is mapped the same way as an event.
     event_log = library.events(match_id)
-    report_payload = st.session_state.get("report") or report_from_library(library, match_id) or {}
+    report_payload = st.session_state.get("report") or _report_payload(library, match_id) or {}
     game_record_for_video = game_lib.find_for_video(video)
     half_minute = None
     if game_record_for_video is not None and game_record_for_video.bounds() is not None:
@@ -2825,7 +2683,7 @@ def events_section(
             "and player tracks** above."
         )
 
-    payload = st.session_state.get("report") or report_from_library(library, match_id)
+    payload = st.session_state.get("report") or _report_payload(library, match_id)
     st.subheader("Highlight reels")
     if not events.events:
         st.info("Tag an event, or run the detector above, before cutting highlights.")
@@ -2835,24 +2693,31 @@ def events_section(
         st.caption("Reels keep the source's resolution, frame rate and picture quality.")
         for tier, seconds in TIER_SECONDS.items():
             reel = select_reel(tier, moments, match_duration_s=probe_cached(video).duration_s)
+            reel_busy = any(
+                job.get("kind") == "reel"
+                and str((job.get("params") or {}).get("tier")) == tier
+                for job in jobs.JOBS.active(match_id=match_id)
+            )
             tier_col, button_col = st.columns([3, 1])
             with tier_col:
                 st.write(f"**{tier}** - {len(reel.moments)} moment(s), {reel.duration_s:.0f}s of a {seconds:.0f}s target")
             with button_col:
                 export_clicked = st.button(
-                    f"Export {tier}", key=f"export_{tier}", disabled=not reel.moments
+                    f"Export {tier}", key=f"export_{tier}", disabled=not reel.moments or reel_busy
                 )
             if export_clicked:
-                # Outside the narrow column, so the progress bar has the full width to breathe.
-                out_path = library.highlights_dir(match_id) / f"{tier}.mp4"
-                bar = st.progress(0.0, text=f"Cutting the {tier} reel ({len(reel.moments)} moments)...")
-                reporter = progress_reporter(bar, f"Cutting the {tier} reel...")
-                # Moments found in another recording are mapped onto this one through the game manifest, so a
-                # whistle scanned on a camera clip lands at the right second of the combined game.
-                export_reel(video, reel, out_path, use_gpu=True, progress=reporter, clip_offsets=_clip_offsets(video))
-                write_manifest(reel, video, out_path.with_suffix(".json"))
-                reporter(1.0, f"{tier} reel ready")
-                st.success(f"Wrote `{_location_label(out_path)}`")
+                jobs.JOBS.submit(
+                    kind="reel",
+                    label=f"{tier} reel",
+                    match_id=match_id,
+                    params={
+                        "match_id": match_id,
+                        "video": str(video),
+                        "tier": tier,
+                        "library_root": _library_root(library),
+                    },
+                )
+                st.success(f"{tier} reel queued - progress appears under Background jobs.")
 
 
 def show_flash(key: str) -> None:
@@ -2880,6 +2745,8 @@ st.caption(
     "Single gimbal camera: the camera's own motion is recovered first, so player positions can be placed on the pitch "
     "even though the camera pans and zooms to follow the ball."
 )
+# Heavy work runs outside this script; this line stays visible when another match's job is running.
+job_ui.running_jobs_badge()
 
 # There is no options sidebar any more: every clip the page cuts or plays is built at full detail, because the
 # cheap preview modes were there to make reviewing a scan bearable and the scan's candidates are now reviewed
@@ -3559,13 +3426,32 @@ else:
             ]
             if not use_log_motion:
                 command.append("--no-log-motion")
-            subprocess.Popen(command, cwd=str(REPO_ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            _queue_status(
+                segment_dir / "status.json",
+                message="Queued - the job manager will start the analysis.",
+                frames_done=0,
+                total_frames=0,
+            )
+            jobs.JOBS.submit(
+                kind="stage_a",
+                label="Stage A analysis",
+                match_id=record_id,
+                argv=command,
+                watch=segment_dir / "status.json",
+                resources=("gpu",),
+            )
             st.session_state["step1_flash"] = (
                 "success",
-                "Analysis started in the background - progress updates here automatically." + saved_note + archived_note,
+                "Analysis queued - it runs in the background and progress updates here automatically."
+                + saved_note
+                + archived_note,
             )
 
-        st.button("Run analysis (background)", type="primary", on_click=_run_analysis)
+        stage_status = read_status(segment_dir) or {}
+        stage_busy = stage_status.get("state") in ("running", "queued") or (
+            match_id is not None and jobs.JOBS.has_active(match_id, kinds=("stage_a",))
+        )
+        st.button("Run analysis (background)", type="primary", on_click=_run_analysis, disabled=stage_busy)
 
 # --------------------------------------------------------------------------------------------------------------
 # Step 2 - pitch registration
@@ -4493,35 +4379,55 @@ if segment is None or calibration is None:
     st.info("Steps 1 and 2 are needed first: the report uses the segment results and the pitch calibration.")
 else:
     # Two ways in: build just the report, or build it and let the background pipeline finish everything else -
-    # the scans, the detectors and a final rebuild - so a rich report is one press.
+    # the scans, the detectors and a final rebuild - so a rich report is one press. Both queue a job and return:
+    # the page stays usable (and another match can be opened) while the work runs in its own process.
+    report_busy = jobs.JOBS.has_active(match_id, kinds=("report", "build_and_detect"))
+    detections_busy = _detections_alive(library, match_id) or jobs.JOBS.has_active(
+        match_id, kinds=("build_and_detect", "detections")
+    )
     build_col, build_all_col = st.columns(2)
     with build_col:
-        build_clicked = st.button("Build report", type="primary")
+        build_clicked = st.button("Build report", type="primary", disabled=report_busy)
     with build_all_col:
         build_all_clicked = st.button(
             "Build report + run all detections",
             type="primary",
-            disabled=_detections_alive(library, match_id),
+            disabled=report_busy or detections_busy,
             help=(
-                "Builds the report and the replay, then runs in the background: the ball scan, the whistle scan "
-                "and the shirt-number scan, the event detectors over what they find, and a final report + replay "
-                "rebuild so the ball and the numbers land on it. Every stage skips finished work and resumes from "
-                "its checkpoint, so a long ball scan can be closed and picked up again."
+                "Queues the report and replay build, then the ball, whistle and shirt-number scans, the event "
+                "detectors over what they find, and a final report + replay rebuild so the ball and the numbers "
+                "land on it. Every stage skips finished work and resumes from its checkpoint, so a long ball scan "
+                "can be closed and picked up again."
             ),
         )
-    if build_clicked or build_all_clicked:
-        _build_report_and_replay(library, match_id, segment, segment_dir, calibration, q, focal)
-        if build_all_clicked:
-            _start_all_detections(library, match_id, chosen, segment_dir)
-            st.success(
-                "All detections are running in the background - progress below. The page stays usable while "
-                "they run; everything they find is saved as they go."
-            )
+    if build_clicked:
+        _submit_report_job(library, match_id, segment_dir)
+        st.session_state["step3_flash"] = (
+            "success",
+            "Report build queued. It runs in the background; the page stays usable and another match can be opened.",
+        )
+        st.rerun()
+    if build_all_clicked:
+        _submit_report_job(
+            library,
+            match_id,
+            segment_dir,
+            with_detections=True,
+            video=str(chosen),
+            strictness=float(st.session_state.get("whistle_strictness", MIN_PROMINENCE)),
+            keep_voices=bool(st.session_state.get("whistle_reject_voices", True)),
+        )
+        st.session_state["step3_flash"] = (
+            "success",
+            "Report and detections queued. The job manager runs them in the background; this page stays usable.",
+        )
+        st.rerun()
+    job_ui.match_jobs_panel(match_id)
     # One place to start and watch every scan - the ball, the whistle, the shirt numbers - and the all-detections
     # run that chains them (its button is above).
     scan_activity_section(library, match_id, segment, segment_dir, chosen)
 
-    payload = st.session_state.get("report") or report_from_library(library, match_id)
+    payload = st.session_state.get("report") or _report_payload(library, match_id)
     if payload:
         metric_columns = st.columns(4)
         metric_columns[0].metric("Frames analyzed", payload["frames_analyzed"])
@@ -4633,7 +4539,9 @@ def _video_export_progress(library: MatchLibrary, match_id: str) -> None:
     watch_key = f"video_export_watch::{match_id}"
     previous = st.session_state.get(watch_key)
     st.session_state[watch_key] = state
-    if state == "running":
+    if state == "queued":
+        st.info("Queued - the job manager will start the export when a slot is free.")
+    elif state == "running":
         progress = float(status.get("progress") or 0.0)
         st.progress(min(1.0, max(0.0, progress)), text=str(status.get("message") or "Exporting..."))
         if not _video_export_alive(library, match_id):
@@ -4657,6 +4565,8 @@ def _video_export_progress(library: MatchLibrary, match_id: str) -> None:
         if details:
             with st.expander("Error details"):
                 st.code(details)
+    elif state in ("cancelled", "stale"):
+        st.info(f"The export is not running: {status.get('message') or state}.")
     if previous == "running" and state != "running":
         st.rerun()
 
@@ -4682,7 +4592,9 @@ def video_export_section(
     overlay_ready = calibration_ready and replay_ready
     ball_ready = (Path(segment_dir) / BALL_TRACK_FILE).exists()
     ball_ready = ball_ready and overlay_ready
-    running = _video_export_alive(library, match_id)
+    running = _video_export_alive(library, match_id) or jobs.JOBS.has_active(
+        match_id, kinds=("video_export",)
+    )
 
     st.caption(
         "With every overlay off this is the match as filmed: the analyzed window is re-encoded at the resolution, "

@@ -26,31 +26,14 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from soccer_analytics.analysis import stage_b
-from soccer_analytics.analysis.ball_lock import ball_image_from_scan
 from soccer_analytics.analysis.library import MatchLibrary
-from soccer_analytics.analysis.projection import project_ball_track, project_segment, segment_poses
-from soccer_analytics.analysis.stage_a import load_segment
-from soccer_analytics.dashboard.replay import build_replay, roles_and_attack, track_boxes, track_boxes
-
-BALL_TRACK_FILE = "ball_track.json"
-
-
-def _ball_records(segment_dir: Path) -> list[dict] | None:
-    """The segment's raw ball scan records, or None when it has not been scanned."""
-    try:
-        payload = json.loads((segment_dir / BALL_TRACK_FILE).read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
-    records = payload.get("frames") or []
-    return records or None
+from soccer_analytics.dashboard.rebuild import build_match_artifacts
 
 
 def main() -> int:
@@ -77,73 +60,24 @@ def main() -> int:
         return 1
 
     started = time.time()
-    segment = load_segment(segment_dir)
-    q, focal = segment_poses(segment, pan_model=calibration.pan_axis_model())
-    print(f"loaded {segment_dir.name} ({time.time() - started:.0f}s)", flush=True)
+    last = {"stage": "", "pct": -1}
 
-    detections = project_segment(segment, calibration, poses=(q, focal))
-    print(f"projected {len(detections.frame)} detections ({time.time() - started:.0f}s)", flush=True)
+    def progress(stage: str, fraction: float, message: str) -> None:
+        pct = int(round(100.0 * max(0.0, min(1.0, fraction))))
+        if stage != last["stage"] or pct // 5 != last["pct"]:
+            last.update(stage=stage, pct=pct // 5)
+            print(f"[{pct:3d}%] {message} ({time.time() - started:.0f}s)", flush=True)
 
-    ball_records = _ball_records(segment_dir)
-    ball_image = ball_image_from_scan(ball_records, len(segment.time)) if ball_records else None
-    report, assignment = stage_b.build_report(
-        detections,
-        pitch_length_m=record.pitch_length_m,
-        pitch_width_m=record.pitch_width_m,
-        match_frames=len(segment.time),
-        ball_image=ball_image,
+    result = build_match_artifacts(
+        library, args.match, segment_dir=segment_dir, on_progress=progress
     )
-    print(f"tracked {len(report.players)} players ({time.time() - started:.0f}s)", flush=True)
-
-    roles, attack = roles_and_attack(
-        report, detections, assignment, segment=segment, pitch_length_m=record.pitch_length_m,
-        swap_attack=bool(record.swap_attack),
-    )
-    replay = build_replay(
-        (record.pitch_length_m, record.pitch_width_m),
-        float(segment.meta["fps"]),
-        len(segment.time),
-        detections.aim_xy,
-        report.players,
-        record.team_names,
-        ball=project_ball_track(ball_records, calibration, q, focal) if ball_records else None,
-        ball_image=ball_image,
-        team_colors=[metrics.kit_rgb for metrics in report.teams],
-        camera_xy=detections.camera_xy,
-        roles=roles,
-        attack=attack,
-    )
-    boxes = track_boxes(report.players)
+    replay = library.load_replay(args.match) or {}
+    boxes = library.load_replay_boxes(args.match)
     boxed = len(boxes)
-
-    # The same payload shape the dashboard saves, so every reader sees one record format.
-    library.save_report(
-        args.match,
-        {
-            "teams": [vars(team) for team in report.teams],
-            "players": [
-                {
-                    "track_id": player.track_id,
-                    "team": player.team,
-                    "observations": len(player.frame),
-                    "distance_m": round(player.distance_m, 1),
-                    "top_speed_kmh": round(float(player.speed_kmh.max()), 1),
-                    "xy": [[round(float(x), 1), round(float(y), 1)] for x, y in player.xy],
-                }
-                for player in report.players
-            ],
-            "momentum": report.momentum,
-            "possession": report.possession,
-            "notes": report.notes,
-            "pitch": [record.pitch_length_m, record.pitch_width_m],
-            "detections_used": report.detections_used,
-            "frames_analyzed": report.frames_analyzed,
-        },
-    )
-    library.save_replay(args.match, replay, boxes=track_boxes(report.players))
     print(
-        f"saved report + replay ({time.time() - started:.0f}s): {len(replay['players'])} players on the field, "
-        f"{boxed} with image boxes, ball track {'yes' if replay.get('ball') else 'no'}",
+        f"saved report + replay ({time.time() - started:.0f}s): {len(replay.get('players', []))} players on the "
+        f"field, {boxed} with image boxes, ball track {'yes' if replay.get('ball') else 'no'}, "
+        f"possession source {(result.get('possession') or {}).get('source', 'camera aim')}",
         flush=True,
     )
     by_time = sorted(replay["players"], key=lambda p: -p["stats"]["time_s"])[:5]

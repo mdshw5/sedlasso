@@ -133,9 +133,15 @@ The dashboard walks through four steps in order, and each one stores its result 
 
 2. **Register the pitch.** Set the measured goal width if it differs from the format's template (a 9v9 pitch fitted with full-size goals is common on shared grounds), then click pitch landmarks on any frame: the four corners first, then goalposts, penalty spots and center-circle cardinals — from one frame or several, because clicks made on different frames are combined. The magnified view and the whole frame sit side by side: click the whole frame to aim the magnified view, scroll to zoom, then click a landmark and pick which one it is in the list that appears. The click is committed the moment you pick, and the calibration refits itself automatically from the clicks so far.
 
-3. **Build the report.** Project detections, track players, split them into teams and compute the metrics — seconds, and re-runnable after re-clicking landmarks without touching the video. *Build report + run all detections* does the same and then everything else in the background: the ball scan, the whistle scan and the shirt-number scan, the event detectors over what they find, and a final rebuild. Every stage skips or resumes finished work, so a long scan can be left running.
+3. **Build the report.** Project detections, track players, split them into teams and compute the metrics. The build is submitted as a background job, so the page returns immediately; *Build report + run all detections* queues the report and then the ball scan, the whistle scan, the shirt-number scan, the event detectors over what they find, and a final rebuild. Every stage skips or resumes finished work, so a long scan can be left running.
 
-4. **Watch, tag and cut highlights.** Tag buttons stack under the pitch animation (Goal, Shot, Save, Tackle, Foul, Corner, Penalty, Block, Clearance, Substitution, Other, with a team picker and an optional note): a press stamps the event on the playback's own second, so tagging happens while the moment is on screen. Inferred events and whistle candidates arrive in the same review queue, with verdict buttons and per-event notes. Reels are exported from the events in three tiers, and the annotated footage runs beside the animation, synced to the same second, offering to start the stream server when it is not running. **Team rosters** are edited under the playback: each team links a saved roster of shirt numbers to player names, and every track the scan gives one of those numbers is then labelled with the name — in the animation, the tables, the events and the stream. A roster stored once is picked again for the next game between the same teams.
+4. **Watch, tag and cut highlights.** Tag buttons stack under the pitch animation (Goal, Shot, Save, Tackle, Foul, Corner, Penalty, Block, Clearance, Substitution, Other, with a team picker and an optional note): a press stamps the event on the playback's own second, so tagging happens while the moment is on screen. Inferred events and whistle candidates arrive in the same review queue, with verdict buttons and per-event notes. Reels and player-centered clips are exported as background jobs in three tiers, and the annotated footage runs beside the animation, synced to the same second, offering to start the stream server when it is not running. **Team rosters** are edited under the playback: each team links a saved roster of shirt numbers to player names, and every track the scan gives one of those numbers is then labelled with the name — in the animation, the tables, the events and the stream. A roster stored once is picked again for the next game between the same teams.
+
+### Background jobs
+
+Heavy work never runs in the Streamlit script thread. The page writes a job spec under `data/jobs/`, a small manager (`scripts/job_manager.py`) starts workers (`scripts/run_job.py`) outside the dashboard, and the page polls the job's `status.json` in a fragment. A global bar at the top of the page shows work running on *any* match, so you can start the enrichment for one game and open another without the dashboard freezing.
+
+The manager runs at most `SOCCER_MAX_JOBS` jobs at once (default 2), treats `gpu` work as exclusive so two scans never share the GPU, and starts every worker at a lower CPU priority than the dashboard. Jobs carry their own log (`data/jobs/<id>/job.log`) and survive a Streamlit reload; queued work can be cancelled from the page. The queue directory is git-ignored.
 
 ### The annotated stream server
 
@@ -226,12 +232,13 @@ src/soccer_analytics/
     ingest/      # GPU-accelerated frame and audio I/O, clip-set source reader
     geometry/    # camera motion (visual and gimbal telemetry), pitch calibration
     analysis/    # Stage A/B, ball scan, kit and jersey analysis, events, highlights
-    dashboard/   # Streamlit app, replay and annotation components, stream server
+    dashboard/   # Streamlit app, replay/annotation components, stream server, job store
     tracking/    # team classification
 tests/           # including a synthetic-match oracle with known ground truth
 scripts/         # entry points and probes: run_stage_a.py, run_ball_scan.py,
                  # run_match_stream.py, run_build_game.py, rebuild_match.py,
-                 # refresh_kit_descriptors.py, migrate_analysis.py, ...
+                 # refresh_kit_descriptors.py, migrate_analysis.py, job_manager.py,
+                 # run_job.py, ...
 ```
 
 ## Tests

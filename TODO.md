@@ -10,6 +10,8 @@
   animation and the stream overlay)
 - [x] Measure possession in image space from the ball scan (nearest player's foot to the ball in the picture),
   with the camera aim point as the fallback when no scan position exists
+- [x] Move heavy dashboard work (report builds, Stage A, scans, detections, video export, reels, player clips) to a
+  file-based background job manager so the page stays responsive and jobs from different matches run independently
 
 ## Remaining
 Nothing currently.
