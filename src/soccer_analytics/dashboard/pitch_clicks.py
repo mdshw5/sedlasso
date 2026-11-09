@@ -19,6 +19,7 @@ off the picture in front of them.
 
 from __future__ import annotations
 
+import base64
 import math
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -26,7 +27,13 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
-from soccer_analytics.geometry.pitch_calibration import Landmark, PitchCalibration, pitch_to_pixels
+from soccer_analytics.geometry.camera_motion import intrinsics
+from soccer_analytics.geometry.pitch_calibration import (
+    Landmark,
+    PitchCalibration,
+    pitch_to_pixels,
+    pixels_to_pitch,
+)
 from soccer_analytics.geometry.pitch_markings import markings_for, with_goal_width
 
 CLICK_MAX_WIDTH = 1600  # canvas pixels sent to the browser; small crops go at native size, which gives the accuracy
@@ -628,6 +635,45 @@ def pitch_marking_polylines(
     return lines
 
 
+def ground_homography(
+    calibration: PitchCalibration, q_frame: np.ndarray, focal_frame: float
+) -> np.ndarray:
+    """The exact pitch-plane -> normalized-pixel homography for one camera state.
+
+    ``pitch_to_pixels`` maps a pitch point through the camera model; on the ground plane (Z = 0) that map is a
+    homography, so it can be built directly instead of fitted to the projected markings. That is both exact and
+    cheap, which is what lets the overlay carry one matrix per picture instead of a coarse grid the browser has
+    to interpolate across. Row-major, mapping ``(x_m, y_m, 1)`` to ``(u, v, 1)`` in frame-normalized pixels.
+    """
+    rotation = calibration.base_rotation @ q_frame  # camera-frame rays -> pitch-frame rays
+    to_camera = np.array(
+        [
+            [1.0, 0.0, -calibration.position[0]],
+            [0.0, 1.0, -calibration.position[1]],
+            [0.0, 0.0, -calibration.position[2]],
+        ]
+    )
+    homography = intrinsics(focal_frame * calibration.focal_scale, calibration.aspect) @ rotation.T @ to_camera
+    # A homography is defined up to scale, and the scale's *sign* decides which side of the horizon the browser
+    # treats as visible (it breaks segments where w <= 0). Normalize by the depth at the ground point under the
+    # image centre - the thing the camera is pointing at, so certainly in front - instead of by h33 (the depth at
+    # the pitch origin). When the origin corner is behind the camera, h33 is negative and dividing by it puts every
+    # visible marking on the browser's "behind" side: the overlay vanished while the still (which projects point by
+    # point through the camera model) drew it correctly.
+    scale = float("nan")
+    aim, valid = pixels_to_pitch(
+        calibration, np.array([[0.5, 0.5 * calibration.aspect]]), q_frame, focal_frame
+    )
+    if valid[0]:
+        scale = float(homography[2] @ np.array([aim[0, 0], aim[0, 1], 1.0]))
+    if not np.isfinite(scale) or abs(scale) < 1e-12:
+        # The centre ray misses the ground (the camera is looking up): fall back to the pitch origin's depth.
+        scale = homography[2, 2]
+    if abs(scale) < 1e-12:
+        scale = float(np.abs(homography).max()) or 1.0
+    return homography / scale
+
+
 def overlay_homographies(
     calibration: PitchCalibration,
     q: np.ndarray,
@@ -638,14 +684,19 @@ def overlay_homographies(
     *,
     format_name: str | None = None,
     samples: int = 240,
+    frames: Iterable[int] | None = None,
 ) -> list[dict]:
-    """Pitch->pixel homographies sampled along the chain, for the browser to project the overlay itself.
+    """Pitch->pixel homographies along the corrected chain, for the browser to project the overlay itself.
 
     The whole-frame viewport is scrubbed and played *in the browser*, so Python never sees most of the frames the
-    overlay has to be drawn on. Instead Python samples the corrected chain at ``samples`` frames and, for each,
-    fits the homography that maps pitch meters to frame-normalized pixels through the calibration at that moment.
-    The browser picks the two samples bracketing the frame it is showing and interpolates the coefficients - the
-    chain is smooth on this spacing, so the interpolation error is far below a pixel.
+    overlay has to be drawn on. Each sample is the calibration's own ground-plane homography at one frame.
+
+    Pass ``frames`` to sample exactly those frames - the caller that knows when the scrub proxy's picture changes
+    uses this to carry one matrix per picture, so the overlay can be drawn without interpolation. Without it the
+    samples are a uniform grid of ``samples`` frames, for the case where the proxy holds every frame and a dense
+    grid plus interpolation is accurate. (A uniform grid over a whole game is *not*: the samples end up ~20 s
+    apart and the camera can pan tens of degrees between them, which is what made the pitch sweep and snap while
+    scrubbing.)
 
     Each entry is ``{"frame": int, "h": [9 floats]}`` with ``h`` row-major, mapping ``(x_m, y_m, 1)`` to
     ``(u, v, 1)`` in frame-normalized pixels (u by width, v by width - the convention everywhere here).
@@ -655,35 +706,36 @@ def overlay_homographies(
     # The chain is the authority on how far the overlay can reach: a segment shorter than the timeline (or a
     # still-frame fallback) must not be indexed past its end.
     limit = min(frame_count, len(q))
-    frames = np.unique(np.linspace(0, limit - 1, min(samples, limit)).round().astype(int))
-    # The markings are the same for every sample; only the projection changes.
-    points = np.concatenate(pitch_marking_polylines(length_m, width_m, format_name=format_name), axis=0)
+    if frames is None:
+        chosen = np.unique(np.linspace(0, limit - 1, min(max(1, samples), limit)).round().astype(int))
+    else:
+        wanted = [int(frame) for frame in frames if 0 <= int(frame) < limit]
+        chosen = np.unique(np.asarray(wanted, dtype=int)) if wanted else np.empty(0, dtype=int)
     out: list[dict] = []
-    for frame in frames:
+    for frame in chosen:
         q_frame, focal_frame = calibration.corrected_frame(q[frame], float(focal[frame]), int(frame))
-        uv, in_front = pitch_to_pixels(calibration, points, q_frame, focal_frame)
-        visible = in_front & np.isfinite(uv).all(axis=1)
-        # A camera at midfield never has the whole pitch in front of it, so the fit uses the visible markings -
-        # the ground-plane projection is a homography, so fitting on any four-plus of them recovers the same H,
-        # which then maps the rest of the plane too.
-        if visible.sum() < 4:
-            continue
-        seen, projected = points[visible], uv[visible]
-        # Solve seen -> projected exactly: 2N equations for the 8 unknowns of H (h33 fixed at 1).
-        ones = np.ones((len(seen), 1))
-        xy1 = np.hstack([seen, ones])
-        a = np.zeros((2 * len(seen), 8))
-        b = np.empty(2 * len(seen))
-        a[0::2, 0:3] = xy1
-        a[0::2, 6:8] = -seen * projected[:, 0, None]
-        a[1::2, 3:6] = xy1
-        a[1::2, 6:8] = -seen * projected[:, 1, None]
-        b[0::2] = projected[:, 0]
-        b[1::2] = projected[:, 1]
-        h, *_ = np.linalg.lstsq(a, b, rcond=None)
-        # Row-major [h11..h32, h33=1], so reshaping to 3x3 puts the fixed scale last.
-        out.append({"frame": int(frame), "h": [*map(float, h), 1.0]})
+        homography = ground_homography(calibration, q_frame, focal_frame)
+        out.append({"frame": int(frame), "h": [*map(float, homography.ravel())]})
     return out
+
+
+def overlay_payload(samples: list[dict], times: Iterable[float], *, mode: str) -> dict:
+    """Pack sampled homographies for the component, compactly enough to re-send on every gesture.
+
+    A whole game carries thousands of samples; as JSON digits that is most of a megabyte on every rerun. Nine
+    little-endian float32s per sample keep it to a few hundred kilobytes, and float32 moves a marking by well
+    under a pixel. ``mode`` tells the component how to pick a sample for the picture on screen: ``"latest"`` (the
+    samples are one per proxy picture - use the one at or before its time) or ``"interpolate"`` (the samples are a
+    dense grid - bracket and blend).
+    """
+    matrices = np.asarray([sample["h"] for sample in samples], dtype="<f4")
+    if matrices.size and matrices.ndim != 2:
+        matrices = matrices.reshape(-1, 9)
+    return {
+        "times": [float(time) for time in times],
+        "matrices": base64.b64encode(matrices.tobytes()).decode("ascii"),
+        "mode": str(mode),
+    }
 
 
 def pitch_overlay(

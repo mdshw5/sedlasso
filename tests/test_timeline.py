@@ -6,6 +6,7 @@ picture), and the proxy build is the part that has to leave the cache in a state
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 
@@ -94,6 +95,31 @@ def test_long_windows_are_built_from_keyframes_alone() -> None:
     assert command[command.index("-skip_frame") + 1] == "nokey"
     # It is an input option: it has to come before the input it applies to.
     assert command.index("-skip_frame") < command.index("-i")
+
+
+def test_picture_times_parse_drop_junk_and_dedupe() -> None:
+    """ffprobe prints one timestamp per keyframe; blanks, N/A and duplicates must not become overlay samples."""
+    output = "0.000000\n1.000000\nN/A\n\n1.000000\n2.500000\n-1.000000\n"
+    assert timeline.parse_picture_times(output) == [0.0, 1.0, 2.5]
+
+
+def test_picture_times_need_a_proxy(tmp_path) -> None:
+    assert timeline.proxy_picture_times(tmp_path) is None
+
+
+def test_picture_times_are_cached_until_the_proxy_changes(tmp_path) -> None:
+    """Probing a whole game's proxy must happen once; a rebuilt proxy must be probed again."""
+    segment = tmp_path / "segment"
+    timeline.scrubber_dir(segment).mkdir(parents=True)
+    proxy = timeline.proxy_path(segment)
+    proxy.write_bytes(b"not really a video")
+    stamp = proxy.stat().st_mtime_ns
+    timeline.pictures_path(segment).write_text(json.dumps({"proxy_mtime_ns": stamp, "times": [1.5, 2.5]}))
+    assert timeline.proxy_picture_times(segment) == [1.5, 2.5]
+    # A new proxy mtime invalidates the cache; the fake file cannot be probed, so the probe fails rather than
+    # serving the stale times.
+    os.utime(proxy, ns=(stamp + 1_000_000, stamp + 1_000_000))
+    assert timeline.proxy_picture_times(segment) is None
 
 
 def test_a_short_proxy_decodes_every_frame() -> None:

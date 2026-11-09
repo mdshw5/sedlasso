@@ -96,6 +96,7 @@ from soccer_analytics.dashboard.pitch_clicks import (
     merge_clicked,
     order_clicks,
     overlay_homographies,
+    overlay_payload,
     parse_result,
     pitch_marking_polylines,
     pitch_overlay,
@@ -261,10 +262,11 @@ def landmark_clicker(
     *,
     proxy_url: str = "",
     frame_count: int = 0,
+    analysis_fps: float = 0.0,
     initial_frame: int = 0,
     marker_kinds: list[str] | None = None,
     mount_nonce: int = 0,
-    overlay_homographies: list[dict] | None = None,
+    overlay: dict | None = None,
     overlay_polylines: list[list[list[float]]] | None = None,
 ) -> None:
     """Draw the landmark clicker over one crop, with the whole frame as its navigation viewport.
@@ -289,14 +291,19 @@ def landmark_clicker(
         overview_data=_encode(overview) if overview is not None else "",
         proxy_url=proxy_url,
         frame_count=int(frame_count),
+        # The proxy runs in real time from the segment's start, so a frame index maps to seconds through the analysis
+        # rate, not through the proxy's own duration: a proxy rebuilt from an older window can be seconds short, and
+        # mapping onto its duration then puts the bar seconds ahead of the picture it is showing.
+        analysis_fps=float(analysis_fps),
         initial_frame=int(initial_frame),
         marker_kinds=list(marker_kinds or []),
         mount_nonce=int(mount_nonce),
         # The whole-frame viewport is scrubbed and played in the browser, so Python cannot draw the pitch overlay
-        # onto frames it never sees. Instead it sends sampled pitch->pixel homographies plus the markings in pitch
-        # meters, and the component projects the overlay itself for whatever frame is on screen - and re-derives it
-        # from the same arguments whenever the calibration changes, so a refit redraws immediately.
-        overlay_homographies=list(overlay_homographies or []),
+        # onto frames it never sees. Instead it sends homographies sampled at the proxy's own picture times (plus
+        # the markings in pitch meters), and the component projects the overlay itself for whatever picture is on
+        # screen - and re-derives it from the same arguments whenever the calibration changes, so a refit redraws
+        # immediately.
+        overlay=overlay or {},
         overlay_polylines=list(overlay_polylines or []),
         initial_polygon=[],
         initial_features=features,
@@ -1199,6 +1206,70 @@ def saved_calibration(
         if abs(float(record.pitch_length_m) - clicks_pitch[0]) > 0.05 or abs(float(record.pitch_width_m) - clicks_pitch[1]) > 0.05:
             return None
     return library.load_calibration(match_id)
+
+
+OVERLAY_FALLBACK_SAMPLES = 4000  # dense grid for proxies that hold every frame (short windows)
+
+
+def timeline_overlay_payload(
+    calibration: PitchCalibration,
+    segment,
+    segment_dir: Path,
+    q: np.ndarray,
+    focal: np.ndarray,
+    length_m: float,
+    width_m: float,
+    frame_count: int,
+    *,
+    format_name: str,
+) -> dict:
+    """Homographies for the browser overlay, sampled where the scrub proxy's picture changes.
+
+    The proxy is only a navigator, but it is the picture the overlay is drawn on. On long windows it is built from
+    keyframes alone, so it holds one picture per source keyframe (about one a second) repeated for the 30 fps
+    stream. The overlay must therefore carry one homography per *picture*, and the component must use the one at or
+    before the presented picture's time - blending between two pictures a second apart is wrong by the whole pan
+    between them, which is what made the pitch sweep and snap while scrubbing a whole game.
+
+    A proxy that decodes every frame (a short window) has a picture per frame, too many to send: it gets a dense
+    uniform grid instead, and the component interpolates. On that spacing (a few hundred milliseconds) the
+    interpolation error is far below a pixel.
+    """
+    fps = float(segment.meta.get("fps") or 15.0)
+    start_s = float(segment.meta.get("start_s", segment.time[0]))
+    duration_s = float(segment.meta.get("end_s", segment.time[-1] + 1.0)) - start_s
+    pictures = None
+    if timeline.proxy_skip_frame(duration_s) == timeline.KEYFRAME_SKIP and timeline.proxy_is_ready(segment_dir):
+        pictures = timeline.proxy_picture_times(segment_dir)
+    if pictures:
+        # A picture time maps to the analyzed frame its camera state was measured at; several pictures can land on
+        # one analyzed frame (the proxy runs at twice the analysis rate), and the first one is the one to keep.
+        by_frame: dict[int, float] = {}
+        for picture_time in pictures:
+            frame = timeline.nearest_frame_index(segment.time, start_s + picture_time)
+            by_frame.setdefault(frame, float(picture_time))
+        samples = overlay_homographies(
+            calibration,
+            q,
+            focal,
+            length_m,
+            width_m,
+            frame_count,
+            format_name=format_name,
+            frames=sorted(by_frame),
+        )
+        return overlay_payload(samples, (by_frame[sample["frame"]] for sample in samples), mode="latest")
+    samples = overlay_homographies(
+        calibration,
+        q,
+        focal,
+        length_m,
+        width_m,
+        frame_count,
+        format_name=format_name,
+        samples=max(1, min(frame_count, OVERLAY_FALLBACK_SAMPLES)),
+    )
+    return overlay_payload(samples, (sample["frame"] / fps for sample in samples), mode="interpolate")
 
 
 def line_landmarks_for_match(library: MatchLibrary, match_id: str) -> list:
@@ -3836,20 +3907,28 @@ are sure of.
                 format_name=format_name,
                 table=land_table,
             )
-        # The browser-side overlay: sampled homographies along the corrected chain plus the markings in pitch
-        # meters, so the component can draw the pitch on whatever frame the timeline is showing - scrubbed or
+        # The browser-side overlay: one homography per picture the scrub proxy can show, plus the markings in pitch
+        # meters, so the component can draw the pitch on whatever picture the timeline is showing - scrubbed or
         # playing - without a round trip per frame. Recomputed from the current calibration on every run, so a
         # refit redraws the overlay immediately.
         browser_overlay = (
-            overlay_homographies(
-                calibration_for_view, q, focal, length_m, width_m, frame_count, format_name=format_name
+            timeline_overlay_payload(
+                calibration_for_view,
+                segment,
+                segment_dir,
+                q,
+                focal,
+                length_m,
+                width_m,
+                frame_count,
+                format_name=format_name,
             )
             if overlay_on and calibration_for_view is not None
-            else []
+            else None
         )
         browser_polylines = (
             [line.tolist() for line in pitch_marking_polylines(length_m, width_m, format_name=format_name)]
-            if browser_overlay
+            if browser_overlay and browser_overlay.get("times")
             else []
         )
         proxy_url = (
@@ -3966,10 +4045,11 @@ are sure of.
             key=component_key,
             proxy_url=proxy_url,
             frame_count=frame_count,
+            analysis_fps=float(segment.meta["fps"]),
             initial_frame=reference,
             marker_kinds=names,
             mount_nonce=jump_nonce,
-            overlay_homographies=browser_overlay,
+            overlay=browser_overlay,
             overlay_polylines=browser_polylines,
         )
 

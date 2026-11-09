@@ -39,6 +39,7 @@ PROXY_FPS = 30.0  # twice the 15 fps analysis rate, so a scrub never skips an an
 PROXY_FILE = "proxy.mp4"
 PROXY_DIR = "scrubber"  # sits under the segment directory, so it invalidates when the segment is rebuilt
 BUILD_STATE_FILE = "scrubber_build.json"
+PICTURES_FILE = "pictures.json"  # cached keyframe timestamps of the proxy (its distinct pictures)
 
 # Long windows are built from keyframes alone. The proxy is only a navigator - whatever frame is landed on is
 # re-read from the source at full resolution - and on this camera's footage (one keyframe per second) skipping the
@@ -77,6 +78,87 @@ def proxy_path(segment_dir: str | Path) -> Path:
 def proxy_is_ready(segment_dir: str | Path) -> bool:
     """Whether the segment's timeline proxy exists and can be played."""
     return proxy_path(segment_dir).exists()
+
+
+def pictures_path(segment_dir: str | Path) -> Path:
+    """Cache of the proxy's distinct-picture timestamps, beside the proxy itself."""
+    return scrubber_dir(segment_dir) / PICTURES_FILE
+
+
+def parse_picture_times(output: str) -> list[float]:
+    """Keyframe timestamps from ``ffprobe -show_entries frame=best_effort_timestamp_time -of csv=p=0``.
+
+    One timestamp per line (``N/A`` for frames ffprobe could not stamp), deduplicated and sorted - the proxy is
+    built with one picture per source keyframe, so this is when the picture under the scrubber actually changes.
+    """
+    times: set[float] = set()
+    for line in output.splitlines():
+        field = line.strip().split(",")[0]
+        if not field or field == "N/A":
+            continue
+        try:
+            value = float(field)
+        except ValueError:
+            continue
+        if np.isfinite(value) and value >= 0.0:
+            times.add(round(value, 6))
+    return sorted(times)
+
+
+def proxy_picture_times(segment_dir: str | Path) -> list[float] | None:
+    """When the proxy's picture changes, in seconds from the proxy's start.
+
+    A keyframe-only proxy (see :func:`proxy_skip_frame`) holds one picture per source keyframe - about one a
+    second on this camera - repeated for the 30 fps stream. Anything drawn on top of the picture has to belong to
+    the picture actually on screen, so the pitch overlay needs these moments rather than a uniform grid: samples
+    blended between two moments a second apart are wrong by the camera's whole pan between them.
+
+    Probing reads packets only and is cached beside the proxy; a rebuilt proxy (new mtime) is probed afresh.
+    Returns ``None`` when there is no proxy or the probe failed, and the caller falls back to interpolated samples.
+    """
+    proxy = proxy_path(segment_dir)
+    if not proxy.exists():
+        return None
+    try:
+        stamp = proxy.stat().st_mtime_ns
+    except OSError:
+        return None
+    cached = pictures_path(segment_dir)
+    if cached.exists():
+        try:
+            payload = json.loads(cached.read_text())
+            if int(payload.get("proxy_mtime_ns", -1)) == stamp:
+                return [float(value) for value in payload["times"]]
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-skip_frame",
+        "nokey",
+        "-show_entries",
+        "frame=best_effort_timestamp_time",
+        "-of",
+        "csv=p=0",
+        str(proxy),
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    times = parse_picture_times(result.stdout)
+    if not times:
+        return None
+    try:
+        cached.write_text(json.dumps({"proxy_mtime_ns": stamp, "times": times}))
+    except OSError:
+        pass
+    return times
 
 
 def frame_time(times: np.ndarray | list[float], index: int) -> float:

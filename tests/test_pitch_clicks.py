@@ -19,6 +19,7 @@ from soccer_analytics.dashboard.pitch_clicks import (
     frame_change,
     frame_points,
     frame_to_canvas,
+    ground_homography,
     inside_crop,
     landmark_help,
     landmark_table,
@@ -27,6 +28,7 @@ from soccer_analytics.dashboard.pitch_clicks import (
     merge_clicked,
     order_clicks,
     overlay_homographies,
+    overlay_payload,
     parse_result,
     pitch_landmark_order,
     pitch_marking_polylines,
@@ -513,6 +515,74 @@ def test_overlay_homographies_skip_frames_without_camera_state() -> None:
     focal = np.full(3, F_CHAIN)
     assert overlay_homographies(calibration, q, focal, 100.0, 64.0, 1000) != []
     assert overlay_homographies(calibration, q, focal, 100.0, 64.0, 0) == []
+
+
+def test_ground_homography_keeps_visible_ground_in_front() -> None:
+    """The browser breaks a marking where w <= 0, so the scale's sign must put the visible side in front.
+
+    A homography is defined up to scale, and normalizing by the pitch origin (h33) flips that sign whenever the
+    origin corner is behind the camera. Measured on the 2026-10-03 game: every visible marking then landed on the
+    browser's "behind" side and the overlay vanished, while the still - projected point by point through the
+    camera model - drew it correctly.
+    """
+    from test_pitch_calibration import ASPECT, F_CHAIN, R_BASE, TRUE_FOCAL_SCALE, TRUE_POSITION, _q_for_pan
+
+    calibration = PitchCalibration(TRUE_POSITION, R_BASE, TRUE_FOCAL_SCALE, ASPECT, 0.0, ())
+    points = np.concatenate(pitch_marking_polylines(100.0, 64.0), axis=0)
+    xy1 = np.hstack([points, np.ones((len(points), 1))])
+    saw_negative_origin = False
+    for pan in (-60.0, -40.0, -20.0, 0.0, 20.0, 40.0):
+        q = _q_for_pan(pan)
+        homography = ground_homography(calibration, q, F_CHAIN)
+        w = xy1 @ homography[2]
+        _, front = pitch_to_pixels(calibration, points, q, F_CHAIN)
+        assert front.sum() >= 4
+        assert np.all(w[front] > 0.0), f"visible markings behind the horizon at pan {pan}"
+        saw_negative_origin = saw_negative_origin or homography[2, 2] < 0.0
+    assert saw_negative_origin, "the sweep must include a camera whose pitch origin is behind it"
+
+
+def test_overlay_homographies_can_sample_exact_frames() -> None:
+    """The per-picture overlay asks for the proxy's own picture frames, not a uniform grid."""
+    from test_pitch_calibration import ASPECT, F_CHAIN, R_BASE, TRUE_FOCAL_SCALE, TRUE_POSITION, _q_for_pan
+
+    calibration = PitchCalibration(TRUE_POSITION, R_BASE, TRUE_FOCAL_SCALE, ASPECT, 0.0, ())
+    frame_count = 50
+    q = np.stack([_q_for_pan(pan) for pan in np.linspace(-20, 20, frame_count)])
+    focal = np.full(frame_count, F_CHAIN)
+    samples = overlay_homographies(
+        calibration, q, focal, 100.0, 64.0, frame_count, frames=[40, 0, 17, 17, 49, 50, -1]
+    )
+    assert [sample["frame"] for sample in samples] == [0, 17, 40, 49]
+    assert all(len(sample["h"]) == 9 for sample in samples)
+
+
+def test_overlay_payload_round_trips_with_subpixel_error() -> None:
+    """The compact payload must decode to the same projection: float32 moves a marking well under a pixel."""
+    from test_pitch_calibration import ASPECT, F_CHAIN, R_BASE, TRUE_FOCAL_SCALE, TRUE_POSITION, _q_for_pan
+
+    import base64
+
+    calibration = PitchCalibration(TRUE_POSITION, R_BASE, TRUE_FOCAL_SCALE, ASPECT, 0.0, ())
+    frame_count = 20
+    q = np.stack([_q_for_pan(pan) for pan in np.linspace(-10, 10, frame_count)])
+    focal = np.full(frame_count, F_CHAIN)
+    samples = overlay_homographies(calibration, q, focal, 100.0, 64.0, frame_count, frames=[3, 7, 12])
+    payload = overlay_payload(samples, [3.0, 7.0, 12.0], mode="latest")
+
+    assert payload["mode"] == "latest"
+    assert payload["times"] == [3.0, 7.0, 12.0]
+    matrices = np.frombuffer(base64.b64decode(payload["matrices"]), dtype="<f4").reshape(-1, 9)
+    assert matrices.shape == (3, 9)
+    for sample, decoded in zip(samples, matrices):
+        h = decoded.reshape(3, 3).astype(np.float64)
+        for probe_xy in ([0.0, 0.0], [100.0, 64.0], [50.0, 32.0]):
+            projected = h @ np.array([*probe_xy, 1.0])
+            uv_h = projected[:2] / projected[2]
+            uv_p, front = pitch_to_pixels(calibration, np.array([probe_xy]), q[sample["frame"]], F_CHAIN)
+            if not front[0]:
+                continue
+            assert np.allclose(uv_h, uv_p[0], atol=1e-4), f"{probe_xy} at frame {sample['frame']}"
 
 
 def test_pitch_marking_polylines_cover_the_standard_markings() -> None:

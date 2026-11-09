@@ -275,14 +275,16 @@
       let videoMode = false;
       let videoReady = false;
       let frameCount = 1;
+      let analysisFps = 0; // analysis frames per second; the proxy runs in real time from the segment's start
       let duration = 0;
       let mounted = false; // whether this iframe has applied its initial frame yet
       let pendingFrame = null; // the frame to land on once the video's metadata has loaded
       let cropFrame = 0; // the frame the magnified crop was actually rendered from
       let seekPending = false;
-      // The pitch overlay, drawn by the browser: sampled pitch->pixel homographies along the chain plus the
-      // markings in pitch meters. Python recomputes both whenever the calibration changes, so a refit redraws.
-      let overlaySamples = []; // [{frame, h: [9]}] sorted by frame
+      // The pitch overlay, drawn by the browser: sampled pitch->pixel homographies plus the markings in pitch
+      // meters. Python recomputes both whenever the calibration changes, so a refit redraws.
+      let overlaySamples = []; // [{t: proxy seconds, h: [9]}] in time order
+      let overlayMode = 'interpolate'; // 'latest' = one sample per proxy picture; 'interpolate' = dense grid
       let overlayPolylines = []; // [[x, y], ...] per marking, in pitch meters
 
       function clamp(value, low, high) {
@@ -343,45 +345,69 @@
         return clampFrame(Number(scrub.value)) === cropFrame;
       }
 
-      /* The overlay for one frame: the two homography samples bracketing it, interpolated coefficient-wise. The
-         chain is smooth on the sample spacing, so the interpolation error is far below a pixel. Outside the
-         sampled range the nearest sample is used, which is what the ends of the video want anyway. */
-      function overlayMatrix(frame) {
-        if (!overlaySamples.length) return null;
-        let lo = overlaySamples[0];
-        let hi = overlaySamples[overlaySamples.length - 1];
-        for (let i = 0; i < overlaySamples.length - 1; i += 1) {
-          if (overlaySamples[i].frame <= frame && frame <= overlaySamples[i + 1].frame) {
-            lo = overlaySamples[i];
-            hi = overlaySamples[i + 1];
-            break;
-          }
+      /* Python sends the sampled homographies as nine little-endian float32s per sample, base64-encoded: one
+         matrix per proxy picture is thousands of samples, which as JSON digits would be most of a megabyte on
+         every gesture. `times` says when each sample's picture starts. */
+      function decodeOverlay(payload) {
+        if (!payload || !Array.isArray(payload.times) || typeof payload.matrices !== 'string') return [];
+        if (!payload.matrices.length) return [];
+        const binary = atob(payload.matrices);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+        const floats = new Float32Array(bytes.buffer);
+        const count = Math.min(payload.times.length, Math.floor(floats.length / 9));
+        const samples = [];
+        for (let i = 0; i < count; i += 1) {
+          samples.push({t: Number(payload.times[i]), h: Array.from(floats.subarray(i * 9, i * 9 + 9))});
         }
-        if (frame <= lo.frame) return lo.h;
-        if (frame >= hi.frame) return hi.h;
-        const t = (frame - lo.frame) / Math.max(1, hi.frame - lo.frame);
-        return lo.h.map((value, i) => value + (hi.h[i] - value) * t);
+        return samples;
       }
 
-      /* The frame whose homography the overlay should draw with. While the proxy *plays*, this is the media time
-         of the frame the eye is actually looking at: `requestVideoFrameCallback` reports it as each frame is
-         presented, so the geometry sits exactly on the picture - `currentTime` alone can advance in ~250 ms
-         steps, which draws fractions of a second off the frame on screen. Browsers without the callback use the
-         video clock via the rAF loop below. At rest (or without a proxy) the scrub readout is used, exactly as
-         before. */
-      function overlayFrame() {
-        if (videoMode && videoReady && !overviewVideo.paused && duration > 0) {
-          const span = Math.max(1, frameCount - 1);
-          const time = presentedMediaTime !== null ? presentedMediaTime : overviewVideo.currentTime;
-          return Math.min(Math.max((time / duration) * span, 0), span);
+      function sampleAtOrBefore(time) {
+        let lo = 0;
+        let hi = overlaySamples.length - 1;
+        if (time < overlaySamples[0].t) return 0;
+        while (lo < hi) {
+          const mid = Math.ceil((lo + hi) / 2);
+          if (overlaySamples[mid].t <= time + 1e-6) lo = mid;
+          else hi = mid - 1;
         }
-        return videoMode && videoReady ? clampFrame(Number(scrub.value)) : cropFrame;
+        return lo;
+      }
+
+      /* The homography for the picture on screen. In "latest" mode the samples are one per proxy picture, and the
+         picture displayed at a media time is the first sample at or before it - using it directly, with no
+         blending, is what keeps the geometry on the picture while scrubbing (between two pictures a second apart
+         a blended matrix is wrong by the whole pan between them). In "interpolate" mode the samples are a dense
+         grid over a proxy that holds every frame, where blending is far below a pixel. */
+      function overlayMatrix(time) {
+        if (!overlaySamples.length) return null;
+        const index = sampleAtOrBefore(time);
+        const before = overlaySamples[index];
+        if (overlayMode === 'latest') return before.h;
+        const after = overlaySamples[Math.min(overlaySamples.length - 1, index + 1)];
+        if (after === before || time <= before.t) return before.h;
+        const t = (time - before.t) / Math.max(1e-9, after.t - before.t);
+        return before.h.map((value, i) => value + (after.h[i] - value) * t);
+      }
+
+      /* The media time of the picture actually on screen. The scrub readout is not it: a keyframe-only proxy
+         repeats one picture for a second or more while the bar moves in 30 fps steps, and a homography drawn for
+         the bar position lands on a different picture than the one the eye sees - which read as an unstable fit
+         during pans. While playing this is the presented frame's own time; while paused it is the video's clock. */
+      function overlayTime() {
+        if (videoMode && videoReady) {
+          if (!overviewVideo.paused) {
+            return presentedMediaTime !== null ? presentedMediaTime : overviewVideo.currentTime;
+          }
+          return overviewVideo.currentTime;
+        }
+        return frameToTime(cropFrame);
       }
 
       function drawPitchOverlay() {
         if (!overlaySamples.length || !overlayPolylines.length) return;
-        const frame = overlayFrame();
-        const h = overlayMatrix(frame);
+        const h = overlayMatrix(overlayTime());
         if (!h) return;
         const frameWidth = args.frame_width || overview.width;
         const frameHeight = args.frame_height || overview.height;
@@ -882,11 +908,16 @@
       }
 
       function frameToTime(frame) {
+        // A frame index maps to seconds through the analysis rate, not the proxy's duration: the proxy is built in
+        // real time from the segment's start, but can be seconds short (an older window, a truncated tail).
+        // Stretching the frames over the shorter duration put the bar seconds ahead of the picture on screen.
+        if (analysisFps > 0) return clampFrame(frame) / analysisFps;
         if (frameCount <= 1 || duration <= 0) return 0;
         return (clampFrame(frame) / (frameCount - 1)) * duration;
       }
 
       function timeToFrame(time) {
+        if (analysisFps > 0) return clampFrame(time * analysisFps);
         if (duration <= 0) return 0;
         return clampFrame((time / duration) * (frameCount - 1));
       }
@@ -954,6 +985,14 @@
         drawOverview();
       });
 
+      // The seek that `input` queued has landed: the picture changed, so the overlay must be the one that belongs
+      // to it. Drawing only on `input` would pair the new bar position with the previous picture until the next
+      // event, which is exactly the lag the overlay keys off the video clock to avoid.
+      overviewVideo.addEventListener('seeked', () => {
+        updateTimelineReadout();
+        drawOverview();
+      });
+
       playBtn.addEventListener('click', () => {
         if (overviewVideo.paused) {
           overviewVideo.play();
@@ -1012,13 +1051,15 @@
           frameCount = Math.round(args.frame_count);
           scrub.max = String(Math.max(0, frameCount - 1));
         }
+        if (typeof args.analysis_fps === 'number' && args.analysis_fps > 0) {
+          analysisFps = args.analysis_fps;
+        }
         // The landmark list comes from Python (it depends on the pitch size). It only needs rewriting when the
         // list actually changes, or a rerun would close the popover the user is about to pick from.
-        // The pitch overlay: sampled homographies plus the markings. Python recomputes both whenever the
+        // The pitch overlay: per-picture homographies plus the markings. Python recomputes both whenever the
         // calibration changes, so a refit redraws the overlay on the next render without any user action.
-        overlaySamples = Array.isArray(args.overlay_homographies)
-          ? args.overlay_homographies.map((sample) => ({frame: Number(sample.frame), h: sample.h.map(Number)}))
-          : [];
+        overlaySamples = decodeOverlay(args.overlay);
+        overlayMode = args.overlay && args.overlay.mode === 'latest' ? 'latest' : 'interpolate';
         overlayPolylines = Array.isArray(args.overlay_polylines)
           ? args.overlay_polylines.map((line) => line.map(([x, y]) => [Number(x), Number(y)]))
           : [];

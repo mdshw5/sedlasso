@@ -120,22 +120,43 @@ def test_a_gesture_carries_its_identity_so_the_sticky_value_can_be_ignored() -> 
     assert "seq += 1;" in html, "every reported gesture is a new one"
 
 
+def test_the_bar_maps_frames_through_the_analysis_rate() -> None:
+    """The proxy can be seconds shorter than the segment, so its duration must not stretch the frame numbering.
+
+    Mapping frame k onto ``k / (frames - 1) * proxy_duration`` put the bar seconds ahead of the picture whenever a
+    proxy was rebuilt from an older window (measured 2.4 s at 61 minutes on a proxy 2.8 s short) - and the overlay,
+    which follows the picture, then disagreed with the still at the crop frame.
+    """
+    html = COMPONENT.read_text()
+    frame_to = html.split("function frameToTime(frame)")[1].split("function timeToFrame")[0]
+    assert "analysisFps > 0" in frame_to and "clampFrame(frame) / analysisFps" in frame_to
+    time_to = html.split("function timeToFrame(time)")[1].split("function updateTimelineReadout")[0]
+    assert "clampFrame(time * analysisFps)" in time_to
+    assert "args.analysis_fps" in html
+
+
 def test_the_pitch_overlay_follows_the_timeline_in_the_browser() -> None:
     """Scrubbing and playing must redraw the pitch overlay without a round trip per frame.
 
-    Python sends sampled pitch->pixel homographies plus the markings; the component interpolates between the two
-    samples bracketing the frame it is showing and projects the markings itself. That is also what makes a refit
-    redraw immediately: the samples arrive as arguments, so the next render carries the new calibration.
+    Python sends one homography per proxy picture plus the markings, and the component draws the sample that
+    belongs to the picture on screen - the presented frame's media time, not the 30 fps scrub readout. Blending
+    between pictures is only for a proxy that holds every frame (a short window), where the samples form a dense
+    grid; between pictures a second apart it is wrong by the whole pan between them.
     """
     html = COMPONENT.read_text()
-    assert "function overlayMatrix(frame)" in html, "the samples are interpolated for the frame being shown"
+    assert "function overlayMatrix(time)" in html, "the sample is picked for the picture being shown"
+    assert "function sampleAtOrBefore(time)" in html, "the picture shown is the sample at or before its time"
+    assert "overlayMode === 'latest'" in html, "per-picture samples are used directly, not blended"
     assert "function drawPitchOverlay()" in html
     assert "drawPitchOverlay();" in html.split("function drawOverview")[1].split("function drawImage")[0], (
         "the overlay is drawn with the rest of the whole-frame view"
     )
-    assert "args.overlay_homographies" in html and "args.overlay_polylines" in html
+    assert "args.overlay" in html and "args.overlay_polylines" in html
+    assert "function decodeOverlay(payload)" in html and "Float32Array" in html, (
+        "the matrices arrive base64-packed, not as JSON digits on every gesture"
+    )
     # The two projections must never stack: the exact still already carries Python's own overlay, so the browser's
-    # interpolated copy is only drawn when the still is not up. Drawing both put one geometry above the other.
+    # copy is only drawn when the still is not up. Drawing both put one geometry above the other.
     overview = html.split("function drawOverview")[1].split("function drawImage")[0]
     branches = overview.split("const stillUp = exact && overviewImage;")[1]
     still_branch, live_branch = branches.split("} else {")
@@ -150,9 +171,10 @@ def test_the_pitch_overlay_follows_the_timeline_in_the_browser() -> None:
     # readout - the presented-frame clock is what keeps the geometry sitting exactly on the picture.
     assert "requestVideoFrameCallback" in html
     assert "metadata.mediaTime" in html
-    frame_of = html.split("function overlayFrame()")[1].split("function drawPitchOverlay")[0]
-    assert "presentedMediaTime" in frame_of, "playing uses the presented frame's time"
-    assert "overviewVideo.currentTime" in frame_of, "the rAF fallback still reads the video clock"
-    assert "!overviewVideo.paused" in frame_of
-    assert "clampFrame(Number(scrub.value))" in frame_of
-    assert "overlayFrame()" in draw
+    time_of = html.split("function overlayTime()")[1].split("function drawPitchOverlay")[0]
+    assert "presentedMediaTime" in time_of, "playing uses the presented frame's time"
+    assert "overviewVideo.currentTime" in time_of, "paused uses the video clock, not the scrub readout"
+    assert "clampFrame(Number(scrub.value))" not in time_of, "the bar is not the picture while paused"
+    # The seek the scrub queued changes the picture; the overlay has to follow it, not the previous one.
+    assert "overviewVideo.addEventListener('seeked'" in html
+    assert "overlayTime()" in draw
